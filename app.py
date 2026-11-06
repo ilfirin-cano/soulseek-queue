@@ -114,7 +114,7 @@ def process_track(track_id):
         found = choose_file(responses, track["title"])
         if not found:
             if not is_retry and cfg["retry_enabled"]:
-                update_track(track_id, status="retry_queued", pass=2, search_id=None)
+                update_track(track_id, status="retry_queued", search_id=None, **{"pass": 2})
             else:
                 update_track(track_id, status="not_found")
             return
