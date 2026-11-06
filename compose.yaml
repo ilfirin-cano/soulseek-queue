@@ -11,6 +11,7 @@ services:
       SEARCH_SECONDS: ${SEARCH_SECONDS:-30}
       RETRY_SECONDS: ${RETRY_SECONDS:-90}
       CONCURRENCY: ${CONCURRENCY:-3}
+      MATCH_THRESHOLD: ${MATCH_THRESHOLD:-25}
       RETRY_ENABLED: ${RETRY_ENABLED:-true}
     volumes:
       - soulseek_queue_data:/data

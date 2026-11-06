@@ -4,3 +4,5 @@
 .stop-button{background:#35221f;border:1px solid #633d37;color:#f3aaa0;border-radius:10px;padding:8px 11px;font:600 11px 'DM Sans';cursor:pointer}.stop-button:hover{background:#482b26}.stop-button.paused{background:#25321e;border-color:#425b31;color:var(--green)}.stop-button:disabled{opacity:.55;cursor:wait}
 @media(max-width:640px){.queue-actions{flex-wrap:wrap;justify-content:flex-end}.stop-button{order:-1}}
 
+.field-hint{display:block;color:var(--muted);font-size:10px;margin-top:6px}
+

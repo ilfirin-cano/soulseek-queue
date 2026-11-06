@@ -1,9 +1,9 @@
 import os
-import re
 import sqlite3
 import threading
 import time
 import uuid
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 
@@ -18,6 +18,7 @@ DEFAULTS = {
     "search_seconds": int(os.environ.get("SEARCH_SECONDS", "30")),
     "retry_seconds": int(os.environ.get("RETRY_SECONDS", "90")),
     "concurrency": int(os.environ.get("CONCURRENCY", "3")),
+    "match_threshold": int(os.environ.get("MATCH_THRESHOLD", "25")),
     "retry_enabled": os.environ.get("RETRY_ENABLED", "true").lower() == "true",
 }
 lock = threading.Lock()
@@ -51,7 +52,7 @@ def init_db():
 def settings():
     with connect() as db:
         result = {r["key"]: r["value"] for r in db.execute("SELECT key,value FROM settings")}
-    for key in ("search_seconds", "retry_seconds", "concurrency"):
+    for key in ("search_seconds", "retry_seconds", "concurrency", "match_threshold"):
         result[key] = int(result[key])
     result["retry_enabled"] = result["retry_enabled"].lower() == "true"
     return result
@@ -67,12 +68,15 @@ def api_request(method, path, **kwargs):
 
 
 def normalize(value):
-    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+    value = unicodedata.normalize("NFKC", value).casefold()
+    return "".join(char if char.isalnum() else " " for char in value).strip()
 
 
-def choose_file(responses, title):
+def choose_file(responses, title, match_threshold=25):
     candidates = []
     needle = normalize(title)
+    if not needle:
+        return None
     for peer in responses or []:
         if not isinstance(peer, dict):
             continue
@@ -83,12 +87,16 @@ def choose_file(responses, title):
             name = file.get("filename", "")
             if os.path.splitext(name)[1].lower() not in AUDIO_EXTS:
                 continue
-            score = SequenceMatcher(None, needle, normalize(os.path.splitext(os.path.basename(name))[0])).ratio()
+            basename = os.path.basename(os.path.splitext(name.replace("\\", "/"))[0])
+            filename = normalize(basename)
+            if not filename:
+                continue
+            score = SequenceMatcher(None, needle, filename).ratio()
             candidates.append((score, username, file))
     if not candidates:
         return None
     score, username, file = max(candidates, key=lambda item: item[0])
-    return (username, file) if score >= 0.38 else None
+    return (username, file) if score >= match_threshold / 100 else None
 
 
 def search_responses(search_id, duration):
@@ -142,7 +150,7 @@ def process_track(track_id):
         if pause_event.is_set():
             update_track(track_id, status="queued" if not is_retry else "retry_queued", search_id=None)
             return
-        found = choose_file(responses, track["title"])
+        found = choose_file(responses, track["title"], cfg["match_threshold"])
         if not found:
             if not is_retry and cfg["retry_enabled"]:
                 update_track(track_id, status="retry_queued", search_id=None, **{"pass": 2})
@@ -259,6 +267,7 @@ def put_settings():
             "search_seconds": max(5, min(600, int(body.get("search_seconds", 30)))),
             "retry_seconds": max(5, min(1800, int(body.get("retry_seconds", 90)))),
             "concurrency": max(1, min(32, int(body.get("concurrency", 3)))),
+            "match_threshold": max(10, min(90, int(body.get("match_threshold", 25)))),
             "retry_enabled": str(bool(body.get("retry_enabled"))).lower(),
         }
         if not values["slskd_url"].startswith(("http://", "https://")):
