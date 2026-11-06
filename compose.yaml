@@ -1,0 +1,20 @@
+services:
+  soulseek-queue:
+    build: .
+    container_name: soulseek-queue
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      SLSKD_URL: ${SLSKD_URL:-http://slskd:5030}
+      SLSKD_API_KEY: ${SLSKD_API_KEY:-}
+      SEARCH_SECONDS: ${SEARCH_SECONDS:-30}
+      RETRY_SECONDS: ${RETRY_SECONDS:-90}
+      CONCURRENCY: ${CONCURRENCY:-3}
+      RETRY_ENABLED: ${RETRY_ENABLED:-true}
+    volumes:
+      - soulseek_queue_data:/data
+    # Put this service on the same Docker network as slskd, or set SLSKD_URL
+    # to a host-reachable address such as http://host.docker.internal:5030.
+volumes:
+  soulseek_queue_data:
