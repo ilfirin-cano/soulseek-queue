@@ -18,3 +18,4 @@ services:
     # to a host-reachable address such as http://host.docker.internal:5030.
 volumes:
   soulseek_queue_data:
+

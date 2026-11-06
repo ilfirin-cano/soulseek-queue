@@ -21,6 +21,7 @@ DEFAULTS = {
     "retry_enabled": os.environ.get("RETRY_ENABLED", "true").lower() == "true",
 }
 lock = threading.Lock()
+pause_event = threading.Event()
 pool = ThreadPoolExecutor(max_workers=32)
 active = 0
 AUDIO_EXTS = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wav", ".aiff", ".wma"}
@@ -43,6 +44,8 @@ def init_db():
             created REAL NOT NULL, updated REAL NOT NULL)""")
         for key, value in DEFAULTS.items():
             db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (key, str(value)))
+        # Requeue work interrupted by a container restart.
+        db.execute("UPDATE tracks SET status=CASE WHEN pass=2 THEN 'retry_queued' ELSE 'queued' END, search_id=NULL WHERE status IN ('claimed','searching','retrying')")
 
 
 def settings():
@@ -67,24 +70,6 @@ def normalize(value):
     return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
 
 
-def search_responses(search_id, duration):
-    deadline = time.monotonic() + duration + 60
-    last_state = "unknown"
-    while time.monotonic() < deadline:
-        state = api_request("GET", f"/searches/{search_id}") or {}
-        last_state = str(state.get("state", "unknown"))
-        normalized = last_state.casefold()
-        if "completed" in normalized or "failed" in normalized or "cancelled" in normalized:
-            # Let slskd finish persisting the final response set before reading it.
-            time.sleep(1)
-            responses = api_request("GET", f"/searches/{search_id}/responses")
-            if isinstance(responses, dict):
-                responses = responses.get("responses", responses.get("items", responses.get("data", [])))
-            return responses or [], last_state
-        time.sleep(1)
-    raise TimeoutError(f"slskd did not finish search within {duration + 60}s (state: {last_state})")
-
-
 def choose_file(responses, title):
     candidates = []
     needle = normalize(title)
@@ -106,6 +91,23 @@ def choose_file(responses, title):
     return (username, file) if score >= 0.38 else None
 
 
+def search_responses(search_id, duration):
+    deadline = time.monotonic() + duration + 60
+    last_state = "unknown"
+    while time.monotonic() < deadline:
+        state = api_request("GET", f"/searches/{search_id}") or {}
+        last_state = str(state.get("state", "unknown"))
+        normalized = last_state.casefold()
+        if "completed" in normalized or "failed" in normalized or "cancelled" in normalized:
+            time.sleep(1)
+            responses = api_request("GET", f"/searches/{search_id}/responses")
+            if isinstance(responses, dict):
+                responses = responses.get("responses", responses.get("items", responses.get("data", [])))
+            return responses or [], last_state
+        time.sleep(1)
+    raise TimeoutError(f"slskd did not finish search within {duration + 60}s (state: {last_state})")
+
+
 def update_track(track_id, **values):
     values["updated"] = time.time()
     with connect() as db:
@@ -122,6 +124,9 @@ def process_track(track_id):
             track = db.execute("SELECT * FROM tracks WHERE id=?", (track_id,)).fetchone()
         cfg = settings()
         is_retry = track["pass"] == 2
+        if pause_event.is_set():
+            update_track(track_id, status="queued" if not is_retry else "retry_queued")
+            return
         update_track(track_id, status="retrying" if is_retry else "searching", error=None)
         duration = cfg["retry_seconds"] if is_retry else cfg["search_seconds"]
         search_id = str(uuid.uuid4())
@@ -130,8 +135,13 @@ def process_track(track_id):
             "responseLimit": 100, "fileLimit": 1000,
         })
         update_track(track_id, search_id=search_id)
+        if pause_event.is_set():
+            api_request("PUT", f"/searches/{search_id}")
         # Wait for slskd's actual terminal state; a fixed sleep can race late responses.
         responses, search_state = search_responses(search_id, duration)
+        if pause_event.is_set():
+            update_track(track_id, status="queued" if not is_retry else "retry_queued", search_id=None)
+            return
         found = choose_file(responses, track["title"])
         if not found:
             if not is_retry and cfg["retry_enabled"]:
@@ -156,7 +166,9 @@ def scheduler():
         try:
             cfg = settings()
             with lock:
-                slots = max(0, cfg["concurrency"] - active)
+                with connect() as db:
+                    running = db.execute("SELECT COUNT(*) FROM tracks WHERE status IN ('claimed','searching','retrying')").fetchone()[0]
+                slots = 0 if pause_event.is_set() else max(0, cfg["concurrency"] - running)
             if slots:
                 with connect() as db:
                     rows = db.execute("SELECT id FROM tracks WHERE status IN ('queued','retry_queued') ORDER BY created LIMIT ?", (slots,)).fetchall()
@@ -206,6 +218,31 @@ def clear_tracks():
     return jsonify(ok=True)
 
 
+@app.get("/api/control")
+def get_control():
+    return jsonify(paused=pause_event.is_set())
+
+
+@app.post("/api/control")
+def set_control():
+    body = request.get_json(silent=True) or {}
+    if body.get("action") == "stop":
+        pause_event.set()
+        with connect() as db:
+            rows = db.execute("SELECT id,search_id FROM tracks WHERE status IN ('searching','retrying')").fetchall()
+        for row in rows:
+            if row["search_id"]:
+                try:
+                    api_request("PUT", f"/searches/{row['search_id']}")
+                except requests.RequestException as exc:
+                    app.logger.warning("Could not stop slskd search %s: %s", row["search_id"], exc)
+        return jsonify(ok=True, paused=True)
+    if body.get("action") == "resume":
+        pause_event.clear()
+        return jsonify(ok=True, paused=False)
+    return jsonify(error="Ожидалось действие stop или resume."), 400
+
+
 @app.get("/api/settings")
 def get_settings():
     cfg = settings()
@@ -241,3 +278,4 @@ threading.Thread(target=scheduler, daemon=True, name="track-scheduler").start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+

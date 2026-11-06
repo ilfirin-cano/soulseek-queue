@@ -8,4 +8,5 @@ COPY templates ./templates
 COPY static ./static
 RUN mkdir -p /data
 EXPOSE 8080
-CMD ["python", "app.py"]
+CMD ["gunicorn", "--workers", "1", "--threads", "16", "--bind", "0.0.0.0:8080", "--access-logfile", "-", "app:app"]
+
