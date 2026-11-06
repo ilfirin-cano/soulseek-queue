@@ -67,12 +67,34 @@ def normalize(value):
     return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
 
 
+def search_responses(search_id, duration):
+    deadline = time.monotonic() + duration + 60
+    last_state = "unknown"
+    while time.monotonic() < deadline:
+        state = api_request("GET", f"/searches/{search_id}") or {}
+        last_state = str(state.get("state", "unknown"))
+        normalized = last_state.casefold()
+        if "completed" in normalized or "failed" in normalized or "cancelled" in normalized:
+            # Let slskd finish persisting the final response set before reading it.
+            time.sleep(1)
+            responses = api_request("GET", f"/searches/{search_id}/responses")
+            if isinstance(responses, dict):
+                responses = responses.get("responses", responses.get("items", responses.get("data", [])))
+            return responses or [], last_state
+        time.sleep(1)
+    raise TimeoutError(f"slskd did not finish search within {duration + 60}s (state: {last_state})")
+
+
 def choose_file(responses, title):
     candidates = []
     needle = normalize(title)
     for peer in responses or []:
+        if not isinstance(peer, dict):
+            continue
         username = peer.get("username")
         for file in peer.get("files", []):
+            if not isinstance(file, dict):
+                continue
             name = file.get("filename", "")
             if os.path.splitext(name)[1].lower() not in AUDIO_EXTS:
                 continue
@@ -108,9 +130,8 @@ def process_track(track_id):
             "responseLimit": 100, "fileLimit": 1000,
         })
         update_track(track_id, search_id=search_id)
-        # slskd runs the search asynchronously; wait for its configured timeout to elapse.
-        time.sleep(duration + 1)
-        responses = api_request("GET", f"/searches/{search_id}/responses") if search_id else []
+        # Wait for slskd's actual terminal state; a fixed sleep can race late responses.
+        responses, search_state = search_responses(search_id, duration)
         found = choose_file(responses, track["title"])
         if not found:
             if not is_retry and cfg["retry_enabled"]:
