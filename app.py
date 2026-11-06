@@ -24,6 +24,7 @@ DEFAULTS = {
 }
 lock = threading.Lock()
 pause_event = threading.Event()
+queue_event = threading.Event()
 pool = ThreadPoolExecutor(max_workers=32)
 active = 0
 stop_epoch = 0
@@ -44,11 +45,20 @@ def init_db():
             id TEXT PRIMARY KEY, title TEXT NOT NULL, query TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'queued', pass INTEGER NOT NULL DEFAULT 1,
             search_id TEXT, result TEXT, username TEXT, filename TEXT, error TEXT,
-            created REAL NOT NULL, updated REAL NOT NULL)""")
+            created REAL NOT NULL, updated REAL NOT NULL,
+            first_pass_seconds REAL, search_seconds_total REAL NOT NULL DEFAULT 0,
+            search_started_at REAL)""")
+        existing = {row["name"] for row in db.execute("PRAGMA table_info(tracks)")}
+        if "first_pass_seconds" not in existing:
+            db.execute("ALTER TABLE tracks ADD COLUMN first_pass_seconds REAL")
+        if "search_seconds_total" not in existing:
+            db.execute("ALTER TABLE tracks ADD COLUMN search_seconds_total REAL NOT NULL DEFAULT 0")
+        if "search_started_at" not in existing:
+            db.execute("ALTER TABLE tracks ADD COLUMN search_started_at REAL")
         for key, value in DEFAULTS.items():
             db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (key, str(value)))
         # Requeue work interrupted by a container restart.
-        db.execute("UPDATE tracks SET status=CASE WHEN pass=2 THEN 'retry_queued' ELSE 'queued' END, search_id=NULL WHERE status IN ('claimed','searching','retrying')")
+        db.execute("UPDATE tracks SET search_seconds_total=search_seconds_total+MAX(0,CAST(strftime('%s','now') AS REAL)-COALESCE(search_started_at,CAST(strftime('%s','now') AS REAL))), search_started_at=NULL, status=CASE WHEN pass=2 THEN 'retry_queued' ELSE 'queued' END, search_id=NULL WHERE status IN ('claimed','searching','retrying')")
 
 
 def settings():
@@ -127,6 +137,7 @@ def update_track(track_id, **values):
 
 def process_track(track_id):
     global active, stop_epoch
+    started_monotonic = None
     with lock:
         active += 1
         started_stop_epoch = stop_epoch
@@ -140,7 +151,10 @@ def process_track(track_id):
             update_track(track_id, status="queued" if not is_retry else "retry_queued", result="Ожидает возобновления")
             return
         duration = cfg["retry_seconds"] if is_retry else cfg["search_seconds"]
+        started_at = time.time()
+        started_monotonic = time.monotonic()
         update_track(track_id, status="retrying" if is_retry else "searching", error=None,
+                     search_started_at=started_at,
                      result=f"Запрос: {track['query']} · до {duration} с · порог {threshold}%")
         search_id = str(uuid.uuid4())
         api_request("POST", "/searches", json={
@@ -154,11 +168,16 @@ def process_track(track_id):
             api_request("PUT", f"/searches/{search_id}")
         # Wait for slskd's actual terminal state; a fixed sleep can race late responses.
         responses, search_state = search_responses(search_id, duration)
+        pass_seconds = round(time.monotonic() - started_monotonic, 2)
+        total_seconds = round((track["search_seconds_total"] or 0) + pass_seconds, 2)
+        timing = {"search_seconds_total": total_seconds, "search_started_at": None}
+        if not is_retry:
+            timing["first_pass_seconds"] = pass_seconds
         with lock:
             stopped_during_search = stop_epoch != started_stop_epoch
         if stopped_during_search:
             update_track(track_id, status="queued" if not is_retry else "retry_queued", search_id=None,
-                         result="Поиск остановлен · трек оставлен в очереди")
+                         result="Поиск остановлен · трек оставлен в очереди", **timing)
             return
         response_count = len(responses)
         file_count = sum(len(peer.get("files", [])) for peer in responses if isinstance(peer, dict))
@@ -174,44 +193,56 @@ def process_track(track_id):
                 best_summary = f"лучшее совпадение {best[2]:.0%} (< {threshold}%) · {best[1].get('filename', '')}"
             if not is_retry and cfg["retry_enabled"]:
                 update_track(track_id, status="retry_queued", search_id=None, **{"pass": 2},
-                             result=f"1-й проход: {search_summary} · {best_summary}; повтор: до {cfg['retry_seconds']} с, порог {cfg['retry_match_threshold']}%")
+                             result=f"1-й проход: {search_summary} · {best_summary}; повтор: до {cfg['retry_seconds']} с, порог {cfg['retry_match_threshold']}%",
+                             **timing)
             else:
                 update_track(track_id, status="not_found", search_id=None,
-                             result=f"{search_summary} · {best_summary}")
+                             result=f"{search_summary} · {best_summary}",
+                             **timing)
             return
         username, file, score = best
         match_summary = f"совпадение {score:.0%} (порог {threshold}%) · {username} · {file.get('filename', '')}"
         update_track(track_id, status="downloading", username=username, filename=file.get("filename"),
-                     result=f"{search_summary} · {match_summary} · отправка в slskd")
+                     result=f"{search_summary} · {match_summary} · отправка в slskd",
+                     **timing)
         api_request("POST", f"/transfers/downloads/{requests.utils.quote(username, safe='')}",
                     json=[{"filename": file["filename"], "size": file.get("size", 0)}])
         update_track(track_id, status="downloaded", result=f"Добавлено в slskd · {score:.0%} · {username} · {file['filename']}")
     except Exception as exc:
-        update_track(track_id, status="error", error=str(exc)[:400])
+        values = {"status": "error", "error": str(exc)[:400], "search_started_at": None}
+        if started_monotonic is not None:
+            elapsed = round(time.monotonic() - started_monotonic, 2)
+            with connect() as db:
+                track = db.execute("SELECT search_seconds_total FROM tracks WHERE id=?", (track_id,)).fetchone()
+            if track:
+                values["search_seconds_total"] = round((track["search_seconds_total"] or 0) + elapsed, 2)
+        update_track(track_id, **values)
     finally:
         with lock:
             active -= 1
+        queue_event.set()
 
 
 def scheduler():
     while True:
+        queue_event.wait()
+        queue_event.clear()
         try:
-            cfg = settings()
-            with lock:
-                with connect() as db:
-                    running = db.execute("SELECT COUNT(*) FROM tracks WHERE status IN ('claimed','searching','retrying')").fetchone()[0]
-                slots = 0 if pause_event.is_set() else max(0, cfg["concurrency"] - running)
-            if slots:
-                with connect() as db:
-                    rows = db.execute("SELECT id FROM tracks WHERE status IN ('queued','retry_queued') ORDER BY created LIMIT ?", (slots,)).fetchall()
-                    # Claim before submitting so the next scheduler tick cannot launch duplicates.
-                    for row in rows:
-                        db.execute("UPDATE tracks SET status='claimed',updated=? WHERE id=?", (time.time(), row["id"]))
+            while not pause_event.is_set():
+                cfg = settings()
+                with lock:
+                    with connect() as db:
+                        running = db.execute("SELECT COUNT(*) FROM tracks WHERE status IN ('claimed','searching','retrying')").fetchone()[0]
+                        slots = max(0, cfg["concurrency"] - running)
+                        rows = db.execute("SELECT id FROM tracks WHERE status IN ('queued','retry_queued') ORDER BY created LIMIT ?", (slots,)).fetchall() if slots else []
+                        for row in rows:
+                            db.execute("UPDATE tracks SET status='claimed',updated=? WHERE id=?", (time.time(), row["id"]))
+                if not rows:
+                    break
                 for row in rows:
                     pool.submit(process_track, row["id"])
         except Exception as exc:
             app.logger.exception("Scheduler error: %s", exc)
-        time.sleep(1)
 
 
 @app.get("/")
@@ -243,6 +274,7 @@ def add_tracks():
                 # Each line may be `Artist - Track`; arbitrary query text is also accepted.
                 db.execute("INSERT INTO tracks(id,title,query,created,updated) VALUES(?,?,?,?,?)",
                            (str(uuid.uuid4()), line, line, now, now))
+    queue_event.set()
     return jsonify(added=len(lines), resumed=resumed)
 
 
@@ -266,6 +298,7 @@ def set_control():
         with lock:
             stop_epoch += 1
             pause_event.set()
+        queue_event.clear()
         with connect() as db:
             rows = db.execute("SELECT id,search_id FROM tracks WHERE status IN ('searching','retrying')").fetchall()
         for row in rows:
@@ -277,6 +310,7 @@ def set_control():
         return jsonify(ok=True, paused=True)
     if body.get("action") == "resume":
         pause_event.clear()
+        queue_event.set()
         return jsonify(ok=True, paused=False)
     return jsonify(error="Ожидалось действие stop или resume."), 400
 
@@ -314,6 +348,7 @@ def put_settings():
 
 
 init_db()
+queue_event.set()
 threading.Thread(target=scheduler, daemon=True, name="track-scheduler").start()
 
 if __name__ == "__main__":
