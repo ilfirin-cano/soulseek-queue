@@ -495,4 +495,49 @@ def set_control():
                 except requests.RequestException as exc:
                     app.logger.warning("Could not stop slskd search %s: %s", row["search_id"], exc)
         return jsonify(ok=True, paused=True)
-    if body.
+    if body.get("action") == "resume":
+        pause_event.clear()
+        queue_event.set()
+        return jsonify(ok=True, paused=False)
+    return jsonify(error="Ожидалось действие stop или resume."), 400
+
+
+@app.get("/api/settings")
+def get_settings():
+    cfg = settings()
+    cfg["api_key_set"] = bool(cfg.pop("api_key"))
+    return jsonify(cfg)
+
+
+@app.put("/api/settings")
+def put_settings():
+    body = request.get_json(silent=True) or {}
+    try:
+        values = {
+            "slskd_url": body.get("slskd_url", "").strip().rstrip("/"),
+            "search_seconds": max(2, min(600, int(body.get("search_seconds", 30)))),
+            "retry_seconds": max(5, min(1800, int(body.get("retry_seconds", 90)))),
+            "concurrency": max(1, min(32, int(body.get("concurrency", 3)))),
+            "match_threshold": max(10, min(90, int(body.get("match_threshold", 25)))),
+            "retry_match_threshold": max(10, min(90, int(body.get("retry_match_threshold", 15)))),
+            "retry_enabled": str(bool(body.get("retry_enabled"))).lower(),
+        }
+        if not values["slskd_url"].startswith(("http://", "https://")):
+            raise ValueError("Укажите адрес slskd с http:// или https://")
+        if body.get("api_key"):
+            values["api_key"] = body["api_key"].strip()
+        with connect() as db:
+            db.executemany("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                           [(k, str(v)) for k, v in values.items()])
+        return jsonify(ok=True)
+    except (TypeError, ValueError) as exc:
+        return jsonify(error=str(exc)), 400
+
+
+init_db()
+queue_event.set()
+threading.Thread(target=scheduler, daemon=True, name="track-scheduler").start()
+threading.Thread(target=transfer_monitor, daemon=True, name="transfer-monitor").start()
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
