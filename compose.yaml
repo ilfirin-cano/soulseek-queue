@@ -4,7 +4,7 @@ services:
     container_name: soulseek-queue
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "8090:8090"
     environment:
       SLSKD_URL: ${SLSKD_URL:-http://slskd:5030}
       SLSKD_API_KEY: ${SLSKD_API_KEY:-}
@@ -14,10 +14,13 @@ services:
       MATCH_THRESHOLD: ${MATCH_THRESHOLD:-25}
       RETRY_MATCH_THRESHOLD: ${RETRY_MATCH_THRESHOLD:-15}
       RETRY_ENABLED: ${RETRY_ENABLED:-true}
+      BURST_SEARCHES: ${BURST_SEARCHES:-false}
+      LASTFM_API_KEY: ${LASTFM_API_KEY:-}
+      LASTFM_SHARED_SECRET: ${LASTFM_SHARED_SECRET:-}
+      LASTFM_USERNAME: ${LASTFM_USERNAME:-}
     volumes:
       - soulseek_queue_data:/data
     # Put this service on the same Docker network as slskd, or set SLSKD_URL
     # to a host-reachable address such as http://host.docker.internal:5030.
 volumes:
   soulseek_queue_data:
-

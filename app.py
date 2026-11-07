@@ -1,4 +1,6 @@
 import contextlib
+import hashlib
+import json
 import os
 import random
 import sqlite3
@@ -23,6 +25,12 @@ DEFAULTS = {
     "match_threshold": int(os.environ.get("MATCH_THRESHOLD", "25")),
     "retry_match_threshold": int(os.environ.get("RETRY_MATCH_THRESHOLD", "15")),
     "retry_enabled": os.environ.get("RETRY_ENABLED", "true").lower() == "true",
+    "burst_searches": os.environ.get("BURST_SEARCHES", "false").lower() == "true",
+    "lastfm_api_key": os.environ.get("LASTFM_API_KEY", ""),
+    "lastfm_shared_secret": os.environ.get("LASTFM_SHARED_SECRET", ""),
+    "lastfm_username": os.environ.get("LASTFM_USERNAME", ""),
+    "lastfm_session_key": "",
+    "lastfm_auth_token": "",
 }
 lock = threading.Lock()
 search_post_lock = threading.Lock()
@@ -31,6 +39,10 @@ pause_event = threading.Event()
 queue_event = threading.Event()
 pool = ThreadPoolExecutor(max_workers=32)
 download_pool = ThreadPoolExecutor(max_workers=4)
+lastfm_cache = {}
+lastfm_cache_lock = threading.Lock()
+lastfm_request_lock = threading.Lock()
+lastfm_last_request = 0.0
 active = 0
 stop_epoch = 0
 AUDIO_EXTS = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wav", ".aiff", ".wma"}
@@ -90,7 +102,133 @@ def settings():
     for key in ("search_seconds", "retry_seconds", "concurrency", "match_threshold", "retry_match_threshold"):
         result[key] = int(result[key])
     result["retry_enabled"] = result["retry_enabled"].lower() == "true"
+    result["burst_searches"] = result["burst_searches"].lower() == "true"
     return result
+
+
+def lastfm_signature(params, secret):
+    message = "".join(f"{key}{params[key]}" for key in sorted(params)
+                      if key not in ("format", "callback", "api_sig")) + secret
+    return hashlib.md5(message.encode("utf-8")).hexdigest()
+
+
+def lastfm_call(method, params=None, signed=False):
+    global lastfm_last_request
+    cfg = settings()
+    if not cfg["lastfm_api_key"]:
+        raise ValueError("Укажите API key Last.fm во вкладке рекомендаций.")
+    values = {"method": method, "api_key": cfg["lastfm_api_key"], "format": "json"}
+    values.update(params or {})
+    if cfg["lastfm_session_key"] and method not in ("auth.getToken", "auth.getSession"):
+        values["sk"] = cfg["lastfm_session_key"]
+        signed = True
+    if signed:
+        if not cfg["lastfm_shared_secret"]:
+            raise ValueError("Укажите Shared Secret Last.fm.")
+        values["api_sig"] = lastfm_signature(values, cfg["lastfm_shared_secret"])
+    with lastfm_request_lock:
+        delay = 0.35 - (time.monotonic() - lastfm_last_request)
+        if delay > 0:
+            time.sleep(delay)
+        lastfm_last_request = time.monotonic()
+        response = requests.get("https://ws.audioscrobbler.com/2.0/", params=values,
+                                headers={"User-Agent": "SoulseekQueue/1.0 (Last.fm recommendations)"}, timeout=20)
+    response.raise_for_status()
+    data = response.json()
+    if "error" in data:
+        raise ValueError(f"Last.fm ({data['error']}): {data.get('message', 'ошибка API')}")
+    return data
+
+
+def lastfm_items(data, container, child):
+    value = (data.get(container) or {}).get(child, [])
+    if isinstance(value, dict):
+        return [value]
+    return value if isinstance(value, list) else []
+
+
+def lastfm_artist_name(value):
+    if isinstance(value, dict):
+        return str(value.get("name") or value.get("#text") or "")
+    return str(value or "")
+
+
+def lastfm_recommendations(body):
+    cfg = settings()
+    mode = str(body.get("mode", "top_tracks"))
+    period = str(body.get("period", "overall"))
+    limit = max(5, min(50, int(body.get("limit", 25))))
+    query = str(body.get("query", "")).strip()
+    cache_key = json.dumps([mode, period, query.casefold(), str(body.get("artist", "")).casefold(), limit, cfg["lastfm_username"]], ensure_ascii=False)
+    now = time.time()
+    with lastfm_cache_lock:
+        cached = lastfm_cache.get(cache_key)
+        if cached and now - cached[0] < 600:
+            return cached[1]
+    user = cfg["lastfm_username"]
+    if mode in ("top_tracks", "recent_tracks", "loved_tracks", "top_artists") and (not user or not cfg["lastfm_session_key"]):
+        raise ValueError("Подключите Last.fm: нужны API key, Shared Secret и авторизация аккаунта.")
+    found = []
+    if mode in ("top_tracks", "recent_tracks", "loved_tracks"):
+        if mode == "top_tracks":
+            seeds = lastfm_items(lastfm_call("user.getTopTracks", {"user": user, "period": period, "limit": 8}), "toptracks", "track")
+        elif mode == "recent_tracks":
+            seeds = lastfm_items(lastfm_call("user.getRecentTracks", {"user": user, "limit": 8}), "recenttracks", "track")
+        else:
+            seeds = lastfm_items(lastfm_call("user.getLovedTracks", {"user": user, "limit": 8}), "lovedtracks", "track")
+        for seed in seeds[:8]:
+            artist_name = lastfm_artist_name(seed.get("artist", {}))
+            track_name = seed.get("name", "")
+            if artist_name and track_name:
+                similar = lastfm_items(lastfm_call("track.getSimilar", {"artist": artist_name, "track": track_name, "limit": 10, "autocorrect": 1}), "similartracks", "track")
+                found.extend({"artist": lastfm_artist_name(item.get("artist")),
+                              "title": item.get("name", ""), "match": item.get("match"), "source": f"Похоже на {artist_name} — {track_name}", "url": item.get("url", ""), "type": "track"} for item in similar)
+    elif mode == "top_artists":
+        seeds = lastfm_items(lastfm_call("user.getTopArtists", {"user": user, "period": period, "limit": 3}), "topartists", "artist")
+        for seed in seeds[:3]:
+            seed_name = seed.get("name", "")
+            similar = lastfm_items(lastfm_call("artist.getSimilar", {"artist": seed_name, "limit": 5, "autocorrect": 1}), "similarartists", "artist")
+            for artist in similar[:3]:
+                name = artist.get("name", "")
+                tracks = lastfm_items(lastfm_call("artist.getTopTracks", {"artist": name, "limit": 5, "autocorrect": 1}), "toptracks", "track") if name else []
+                found.extend({"artist": name, "title": track.get("name", ""), "match": artist.get("match"),
+                              "source": f"Похож на {seed_name}", "url": track.get("url", ""), "type": "track"} for track in tracks)
+    elif mode == "genre_tracks":
+        if not query:
+            raise ValueError("Введите жанр или тег.")
+        tracks = lastfm_items(lastfm_call("tag.getTopTracks", {"tag": query, "limit": limit}), "tracks", "track")
+        found = [{"artist": lastfm_artist_name(track.get("artist")),
+                  "title": track.get("name", ""), "match": None, "source": f"Жанр: {query}", "url": track.get("url", ""), "type": "track"} for track in tracks]
+    elif mode == "genre_artists":
+        if not query:
+            raise ValueError("Введите жанр или тег.")
+        artists = lastfm_items(lastfm_call("tag.getTopArtists", {"tag": query, "limit": limit}), "topartists", "artist")
+        found = [{"artist": item.get("name", ""), "title": "", "match": None, "source": f"Жанр: {query}", "url": item.get("url", ""), "type": "artist"} for item in artists]
+    elif mode == "similar_artist":
+        if not query:
+            raise ValueError("Введите исполнителя.")
+        artists = lastfm_items(lastfm_call("artist.getSimilar", {"artist": query, "limit": limit, "autocorrect": 1}), "similarartists", "artist")
+        found = [{"artist": item.get("name", ""), "title": "", "match": item.get("match"), "source": f"Похож на {query}", "url": item.get("url", ""), "type": "artist"} for item in artists]
+    elif mode == "similar_track":
+        artist = str(body.get("artist", "")).strip()
+        if not artist or not query:
+            raise ValueError("Введите исполнителя и название трека.")
+        tracks = lastfm_items(lastfm_call("track.getSimilar", {"artist": artist, "track": query, "limit": limit, "autocorrect": 1}), "similartracks", "track")
+        found = [{"artist": lastfm_artist_name(item.get("artist")),
+                  "title": item.get("name", ""), "match": item.get("match"), "source": f"Похоже на {artist} — {query}", "url": item.get("url", ""), "type": "track"} for item in tracks]
+    else:
+        raise ValueError("Неизвестный способ рекомендаций.")
+    deduped, seen = [], set()
+    for item in found:
+        key = (item.get("artist", "").casefold(), item.get("title", "").casefold())
+        if key != ("", "") and key not in seen:
+            seen.add(key)
+            deduped.append(item)
+        if len(deduped) >= limit:
+            break
+    with lastfm_cache_lock:
+        lastfm_cache[cache_key] = (now, deduped)
+    return deduped
 
 
 def api_request(method, path, **kwargs):
@@ -407,7 +545,18 @@ def scheduler():
                         if slots:
                             primary_count = db.execute("SELECT COUNT(*) FROM tracks WHERE status='queued' AND pass=1").fetchone()[0]
                             if primary_count:
-                                rows = db.execute("SELECT id FROM tracks WHERE status='queued' AND pass=1 ORDER BY created LIMIT ?", (slots,)).fetchall()
+                                effective_limit = cfg["concurrency"]
+                                queued = db.execute("SELECT id,batch_id FROM tracks WHERE status='queued' AND pass=1 ORDER BY created LIMIT ?", (slots + 5,)).fetchall()
+                                if cfg["burst_searches"] and cfg["concurrency"] <= 5 and queued:
+                                    batch_id = queued[0]["batch_id"]
+                                    first_five_open = db.execute("""SELECT COUNT(*) FROM (
+                                        SELECT status FROM tracks WHERE batch_id=? AND pass=1 ORDER BY created LIMIT 5
+                                    ) WHERE status IN ('queued','claimed','searching')""", (batch_id,)).fetchone()[0]
+                                    if first_five_open:
+                                        effective_limit = 5
+                                        rows = db.execute("SELECT id FROM tracks WHERE status='queued' AND pass=1 AND batch_id=? ORDER BY created LIMIT ?", (batch_id, max(0, effective_limit-running))).fetchall()
+                                if not rows:
+                                    rows = db.execute("SELECT id FROM tracks WHERE status='queued' AND pass=1 ORDER BY created LIMIT ?", (max(0, effective_limit-running),)).fetchall()
                             else:
                                 rows = db.execute("SELECT id FROM tracks WHERE status='retry_queued' AND pass=2 ORDER BY created LIMIT ?", (slots,)).fetchall()
                                 if not rows and running == 0:
@@ -460,7 +609,7 @@ def add_tracks():
 @app.delete("/api/tracks")
 def clear_tracks():
     with connect() as db:
-        db.execute("DELETE FROM tracks WHERE status IN ('downloaded','download_error','not_found','error')")
+        db.execute("DELETE FROM tracks WHERE status IN ('downloaded','download_error','not_found','error','found')")
     return jsonify(ok=True)
 
 
@@ -506,6 +655,10 @@ def set_control():
 def get_settings():
     cfg = settings()
     cfg["api_key_set"] = bool(cfg.pop("api_key"))
+    cfg["lastfm_api_key_set"] = bool(cfg.pop("lastfm_api_key"))
+    cfg["lastfm_shared_secret_set"] = bool(cfg.pop("lastfm_shared_secret"))
+    cfg.pop("lastfm_session_key", None)
+    cfg.pop("lastfm_auth_token", None)
     return jsonify(cfg)
 
 
@@ -521,6 +674,7 @@ def put_settings():
             "match_threshold": max(10, min(90, int(body.get("match_threshold", 25)))),
             "retry_match_threshold": max(10, min(90, int(body.get("retry_match_threshold", 15)))),
             "retry_enabled": str(bool(body.get("retry_enabled"))).lower(),
+            "burst_searches": str(bool(body.get("burst_searches"))).lower(),
         }
         if not values["slskd_url"].startswith(("http://", "https://")):
             raise ValueError("Укажите адрес slskd с http:// или https://")
@@ -534,10 +688,88 @@ def put_settings():
         return jsonify(error=str(exc)), 400
 
 
+@app.get("/api/lastfm/config")
+def get_lastfm_config():
+    cfg = settings()
+    return jsonify(api_key_set=bool(cfg["lastfm_api_key"]), secret_set=bool(cfg["lastfm_shared_secret"]),
+                   connected=bool(cfg["lastfm_session_key"]), username=cfg["lastfm_username"])
+
+
+@app.put("/api/lastfm/config")
+def put_lastfm_config():
+    body = request.get_json(silent=True) or {}
+    values = {}
+    for field, key in (("api_key", "lastfm_api_key"), ("shared_secret", "lastfm_shared_secret")):
+        value = str(body.get(field, "")).strip()
+        if value:
+            values[key] = value
+    username = str(body.get("username", "")).strip()
+    if username:
+        values["lastfm_username"] = username
+    if not settings()["lastfm_api_key"] and "lastfm_api_key" not in values:
+        return jsonify(error="Введите API key Last.fm."), 400
+    if not settings()["lastfm_shared_secret"] and "lastfm_shared_secret" not in values:
+        return jsonify(error="Введите Shared Secret Last.fm."), 400
+    if values:
+        with connect() as db:
+            if ("lastfm_api_key" in values and values["lastfm_api_key"] != settings()["lastfm_api_key"]) or ("lastfm_shared_secret" in values and values["lastfm_shared_secret"] != settings()["lastfm_shared_secret"]):
+                db.execute("UPDATE settings SET value='' WHERE key IN ('lastfm_session_key','lastfm_auth_token')")
+            db.executemany("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                           [(key, value) for key, value in values.items()])
+    return jsonify(ok=True)
+
+
+@app.post("/api/lastfm/auth/start")
+def lastfm_auth_start():
+    try:
+        token = lastfm_call("auth.getToken", signed=True).get("token")
+        if not token:
+            raise ValueError("Last.fm не вернул токен авторизации.")
+        with connect() as db:
+            db.execute("UPDATE settings SET value=? WHERE key='lastfm_auth_token'", (token,))
+        cfg = settings()
+        from urllib.parse import urlencode
+        return jsonify(url="https://www.last.fm/api/auth/?" + urlencode({"api_key": cfg["lastfm_api_key"], "token": token}))
+    except Exception as exc:
+        return jsonify(error=str(exc)), 400
+
+
+@app.post("/api/lastfm/auth/complete")
+def lastfm_auth_complete():
+    try:
+        token = settings()["lastfm_auth_token"]
+        if not token:
+            raise ValueError("Сначала нажмите «Подключить Last.fm» и подтвердите доступ.")
+        session = lastfm_call("auth.getSession", {"token": token}, signed=True).get("session", {})
+        if not session.get("key"):
+            raise ValueError("Last.fm не вернул ключ сессии.")
+        with connect() as db:
+            db.executemany("UPDATE settings SET value=? WHERE key=?", [
+                (session["key"], "lastfm_session_key"), (session.get("name", ""), "lastfm_username"), ("", "lastfm_auth_token")])
+        return jsonify(connected=True, username=session.get("name", ""))
+    except Exception as exc:
+        return jsonify(error=str(exc)), 400
+
+
+@app.delete("/api/lastfm/session")
+def delete_lastfm_session():
+    with connect() as db:
+        db.executemany("UPDATE settings SET value='' WHERE key=?", [("lastfm_session_key",), ("lastfm_auth_token",), ("lastfm_username",)])
+    return jsonify(ok=True)
+
+
+@app.post("/api/lastfm/recommendations")
+def get_lastfm_recommendations():
+    try:
+        return jsonify(items=lastfm_recommendations(request.get_json(silent=True) or {}))
+    except Exception as exc:
+        return jsonify(error=str(exc)), 400
+
+
 init_db()
 queue_event.set()
 threading.Thread(target=scheduler, daemon=True, name="track-scheduler").start()
 threading.Thread(target=transfer_monitor, daemon=True, name="transfer-monitor").start()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8090")))
