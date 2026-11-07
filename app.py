@@ -131,8 +131,11 @@ def lastfm_call(method, params=None, signed=False):
         if delay > 0:
             time.sleep(delay)
         lastfm_last_request = time.monotonic()
+        proxy_url = os.environ.get("LASTFM_PROXY_URL", "").rstrip("/")
+        proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
         response = requests.get("https://ws.audioscrobbler.com/2.0/", params=values,
-                                headers={"User-Agent": "SoulseekQueue/1.0 (Last.fm recommendations)"}, timeout=20)
+                                headers={"User-Agent": "SoulseekQueue/1.0 (Last.fm recommendations)"},
+                                proxies=proxies, timeout=20)
     response.raise_for_status()
     data = response.json()
     if "error" in data:
