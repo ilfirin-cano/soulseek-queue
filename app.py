@@ -160,7 +160,7 @@ def lastfm_recommendations(body):
     cfg = settings()
     mode = str(body.get("mode", "top_tracks"))
     period = str(body.get("period", "overall"))
-    limit = max(5, min(50, int(body.get("limit", 25))))
+    limit = max(1, min(50, int(body.get("limit", 25))))
     query = str(body.get("query", "")).strip()
     cache_key = json.dumps([mode, period, query.casefold(), str(body.get("artist", "")).casefold(), limit, cfg["lastfm_username"]], ensure_ascii=False)
     now = time.time()
@@ -597,16 +597,20 @@ def add_tracks():
     now = time.time()
     batch_id = str(uuid.uuid4())
     download_enabled = 1 if body.get("download", True) else 0
-    resumed = pause_event.is_set()
+    start = bool(body.get("start", True))
+    resumed = pause_event.is_set() and start
+    status = "queued" if start else "staged"
     with lock:
-        pause_event.clear()
+        if start:
+            pause_event.clear()
         with connect() as db:
             for line in lines:
                 # Each line may be `Artist - Track`; arbitrary query text is also accepted.
-                db.execute("INSERT INTO tracks(id,title,query,created,updated,batch_id,download_enabled) VALUES(?,?,?,?,?,?,?)",
-                           (str(uuid.uuid4()), line, line, now, now, batch_id, download_enabled))
-    queue_event.set()
-    return jsonify(added=len(lines), resumed=resumed)
+                db.execute("INSERT INTO tracks(id,title,query,status,created,updated,batch_id,download_enabled) VALUES(?,?,?,?,?,?,?,?)",
+                           (str(uuid.uuid4()), line, line, status, now, now, batch_id, download_enabled))
+    if start:
+        queue_event.set()
+    return jsonify(added=len(lines), resumed=resumed, staged=not start)
 
 
 @app.delete("/api/tracks")
@@ -614,6 +618,38 @@ def clear_tracks():
     with connect() as db:
         db.execute("DELETE FROM tracks WHERE status IN ('downloaded','download_error','not_found','error','found')")
     return jsonify(ok=True)
+
+
+@app.post("/api/tracks/start-staged")
+def start_staged_tracks():
+    with lock:
+        pause_event.clear()
+        with connect() as db:
+            result = db.execute("UPDATE tracks SET status='queued',updated=? WHERE status='staged'", (time.time(),))
+            started = result.rowcount
+    if started:
+        queue_event.set()
+    return jsonify(started=started)
+
+
+@app.post("/api/tracks/stop-clear")
+def stop_and_clear_tracks():
+    global stop_epoch
+    with lock:
+        stop_epoch += 1
+        pause_event.set()
+        queue_event.clear()
+    with connect() as db:
+        rows = db.execute("SELECT id,search_id FROM tracks WHERE status IN ('searching','retrying','sequential_searching')").fetchall()
+    for row in rows:
+        if row["search_id"]:
+            try:
+                api_request("PUT", f"/searches/{row['search_id']}")
+            except requests.RequestException as exc:
+                app.logger.warning("Could not stop slskd search %s: %s", row["search_id"], exc)
+    with connect() as db:
+        db.execute("DELETE FROM tracks")
+    return jsonify(ok=True, paused=True, cleared=True)
 
 
 @app.post("/api/tracks/download-found")
@@ -695,7 +731,8 @@ def put_settings():
 def get_lastfm_config():
     cfg = settings()
     return jsonify(api_key_set=bool(cfg["lastfm_api_key"]), secret_set=bool(cfg["lastfm_shared_secret"]),
-                   connected=bool(cfg["lastfm_session_key"]), username=cfg["lastfm_username"])
+                   connected=bool(cfg["lastfm_session_key"]), auth_pending=bool(cfg["lastfm_auth_token"]),
+                   username=cfg["lastfm_username"])
 
 
 @app.put("/api/lastfm/config")
