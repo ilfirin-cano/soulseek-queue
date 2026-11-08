@@ -1,9 +1,12 @@
 import contextlib
+import filecmp
 import hashlib
 import json
 import os
 import pathlib
 import random
+import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -50,6 +53,8 @@ stop_epoch = 0
 AUDIO_EXTS = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wav", ".aiff", ".wma"}
 NAVIDROME_MUSIC_PATH = os.environ.get("NAVIDROME_MUSIC_PATH", "").strip()
 NAVIDROME_PLAYLIST_PATH = os.environ.get("NAVIDROME_PLAYLIST_PATH", "").strip()
+SLSKD_DOWNLOADS_PATH = os.environ.get("SLSKD_DOWNLOADS_PATH", "").strip()
+DOWNLOAD_DESTINATION_PATH = os.environ.get("DOWNLOAD_DESTINATION_PATH", "").strip()
 RECENT_PLAYLIST_ID = "recent_tracks"
 
 
@@ -71,7 +76,8 @@ def init_db():
             first_pass_seconds REAL, search_seconds_total REAL NOT NULL DEFAULT 0,
             search_started_at REAL, batch_id TEXT, download_enabled INTEGER NOT NULL DEFAULT 1,
             download_id TEXT, download_requested_at REAL, download_state TEXT,
-            filesize INTEGER NOT NULL DEFAULT 0)""")
+            filesize INTEGER NOT NULL DEFAULT 0, local_path TEXT,
+            move_attempts INTEGER NOT NULL DEFAULT 0)""")
         db.execute("""CREATE TABLE IF NOT EXISTS recommendation_playlists (
             id TEXT PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL,
             updated REAL NOT NULL)""")
@@ -102,6 +108,10 @@ def init_db():
             db.execute("ALTER TABLE tracks ADD COLUMN filesize INTEGER NOT NULL DEFAULT 0")
         if "recommendation_id" not in existing:
             db.execute("ALTER TABLE tracks ADD COLUMN recommendation_id TEXT")
+        if "local_path" not in existing:
+            db.execute("ALTER TABLE tracks ADD COLUMN local_path TEXT")
+        if "move_attempts" not in existing:
+            db.execute("ALTER TABLE tracks ADD COLUMN move_attempts INTEGER NOT NULL DEFAULT 0")
         for key, value in DEFAULTS.items():
             db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (key, str(value)))
         # Requeue work interrupted by a container restart and preserve the search batch.
@@ -177,13 +187,14 @@ def lastfm_recommendations(body):
     mode = str(body.get("mode", "top_tracks"))
     period = str(body.get("period", "overall"))
     limit = max(1, min(50, int(body.get("limit", 25))))
+    candidate_limit = min(200, max(50, limit * 5))
     query = str(body.get("query", "")).strip()
     cache_key = json.dumps([mode, period, query.casefold(), str(body.get("artist", "")).casefold(), limit, cfg["lastfm_username"]], ensure_ascii=False)
     now = time.time()
     with lastfm_cache_lock:
         cached = lastfm_cache.get(cache_key)
-        if cached and now - cached[0] < 600:
-            return cached[1]
+        if mode != "recent_tracks" and cached and now - cached[0] < 600:
+            return random.sample(cached[1], min(limit, len(cached[1])))
     user = cfg["lastfm_username"]
     if mode in ("top_tracks", "recent_tracks", "loved_tracks", "top_artists") and (not user or not cfg["lastfm_session_key"]):
         raise ValueError("Подключите Last.fm: нужны API key, Shared Secret и авторизация аккаунта.")
@@ -192,47 +203,51 @@ def lastfm_recommendations(body):
         if mode == "top_tracks":
             seeds = lastfm_items(lastfm_call("user.getTopTracks", {"user": user, "period": period, "limit": 8}), "toptracks", "track")
         elif mode == "recent_tracks":
-            seeds = lastfm_items(lastfm_call("user.getRecentTracks", {"user": user, "limit": 8}), "recenttracks", "track")
+            recent = lastfm_items(lastfm_call("user.getRecentTracks", {"user": user, "limit": 100}), "recenttracks", "track")
+            found = [{"artist": lastfm_artist_name(item.get("artist")),
+                      "title": item.get("name", ""), "match": None, "source": "Недавние прослушивания",
+                      "url": item.get("url", ""), "type": "track"} for item in recent]
+            seeds = []
         else:
             seeds = lastfm_items(lastfm_call("user.getLovedTracks", {"user": user, "limit": 8}), "lovedtracks", "track")
         for seed in seeds[:8]:
             artist_name = lastfm_artist_name(seed.get("artist", {}))
             track_name = seed.get("name", "")
             if artist_name and track_name:
-                similar = lastfm_items(lastfm_call("track.getSimilar", {"artist": artist_name, "track": track_name, "limit": 10, "autocorrect": 1}), "similartracks", "track")
+                similar = lastfm_items(lastfm_call("track.getSimilar", {"artist": artist_name, "track": track_name, "limit": candidate_limit, "autocorrect": 1}), "similartracks", "track")
                 found.extend({"artist": lastfm_artist_name(item.get("artist")),
                               "title": item.get("name", ""), "match": item.get("match"), "source": f"Похоже на {artist_name} — {track_name}", "url": item.get("url", ""), "type": "track"} for item in similar)
     elif mode == "top_artists":
         seeds = lastfm_items(lastfm_call("user.getTopArtists", {"user": user, "period": period, "limit": 3}), "topartists", "artist")
         for seed in seeds[:3]:
             seed_name = seed.get("name", "")
-            similar = lastfm_items(lastfm_call("artist.getSimilar", {"artist": seed_name, "limit": 5, "autocorrect": 1}), "similarartists", "artist")
+            similar = lastfm_items(lastfm_call("artist.getSimilar", {"artist": seed_name, "limit": candidate_limit, "autocorrect": 1}), "similarartists", "artist")
             for artist in similar[:3]:
                 name = artist.get("name", "")
-                tracks = lastfm_items(lastfm_call("artist.getTopTracks", {"artist": name, "limit": 5, "autocorrect": 1}), "toptracks", "track") if name else []
+                tracks = lastfm_items(lastfm_call("artist.getTopTracks", {"artist": name, "limit": candidate_limit, "autocorrect": 1}), "toptracks", "track") if name else []
                 found.extend({"artist": name, "title": track.get("name", ""), "match": artist.get("match"),
                               "source": f"Похож на {seed_name}", "url": track.get("url", ""), "type": "track"} for track in tracks)
     elif mode == "genre_tracks":
         if not query:
             raise ValueError("Введите жанр или тег.")
-        tracks = lastfm_items(lastfm_call("tag.getTopTracks", {"tag": query, "limit": limit}), "tracks", "track")
+        tracks = lastfm_items(lastfm_call("tag.getTopTracks", {"tag": query, "limit": candidate_limit}), "tracks", "track")
         found = [{"artist": lastfm_artist_name(track.get("artist")),
                   "title": track.get("name", ""), "match": None, "source": f"Жанр: {query}", "url": track.get("url", ""), "type": "track"} for track in tracks]
     elif mode == "genre_artists":
         if not query:
             raise ValueError("Введите жанр или тег.")
-        artists = lastfm_items(lastfm_call("tag.getTopArtists", {"tag": query, "limit": limit}), "topartists", "artist")
+        artists = lastfm_items(lastfm_call("tag.getTopArtists", {"tag": query, "limit": candidate_limit}), "topartists", "artist")
         found = [{"artist": item.get("name", ""), "title": "", "match": None, "source": f"Жанр: {query}", "url": item.get("url", ""), "type": "artist"} for item in artists]
     elif mode == "similar_artist":
         if not query:
             raise ValueError("Введите исполнителя.")
-        artists = lastfm_items(lastfm_call("artist.getSimilar", {"artist": query, "limit": limit, "autocorrect": 1}), "similarartists", "artist")
+        artists = lastfm_items(lastfm_call("artist.getSimilar", {"artist": query, "limit": candidate_limit, "autocorrect": 1}), "similarartists", "artist")
         found = [{"artist": item.get("name", ""), "title": "", "match": item.get("match"), "source": f"Похож на {query}", "url": item.get("url", ""), "type": "artist"} for item in artists]
     elif mode == "similar_track":
         artist = str(body.get("artist", "")).strip()
         if not artist or not query:
             raise ValueError("Введите исполнителя и название трека.")
-        tracks = lastfm_items(lastfm_call("track.getSimilar", {"artist": artist, "track": query, "limit": limit, "autocorrect": 1}), "similartracks", "track")
+        tracks = lastfm_items(lastfm_call("track.getSimilar", {"artist": artist, "track": query, "limit": candidate_limit, "autocorrect": 1}), "similartracks", "track")
         found = [{"artist": lastfm_artist_name(item.get("artist")),
                   "title": item.get("name", ""), "match": item.get("match"), "source": f"Похоже на {artist} — {query}", "url": item.get("url", ""), "type": "track"} for item in tracks]
     else:
@@ -243,11 +258,9 @@ def lastfm_recommendations(body):
         if key != ("", "") and key not in seen:
             seen.add(key)
             deduped.append(item)
-        if len(deduped) >= limit:
-            break
     with lastfm_cache_lock:
         lastfm_cache[cache_key] = (now, deduped)
-    return deduped
+    return random.sample(deduped, min(limit, len(deduped)))
 
 
 def recommendation_item_id(item, playlist_id=RECENT_PLAYLIST_ID):
@@ -298,12 +311,12 @@ def _write_navidrome_playlist():
                 media_by_stem.setdefault(normalize(path.stem), []).append(path)
     with connect() as db:
         rows = db.execute("""SELECT ri.id,ri.artist,ri.title,ri.position,ri.local_path,
-            t.filename,t.status FROM recommendation_items ri
+            t.filename,t.status,t.local_path AS track_local_path FROM recommendation_items ri
             LEFT JOIN tracks t ON t.id=ri.track_id
             WHERE ri.playlist_id=? ORDER BY ri.position""", (RECENT_PLAYLIST_ID,)).fetchall()
         lines = ["#EXTM3U"]
         for row in rows:
-            relative = row["local_path"]
+            relative = row["local_path"] or row["track_local_path"]
             if relative:
                 candidate = (root / pathlib.PurePosixPath(relative)).resolve()
                 if not candidate.is_relative_to(root) or not candidate.is_file():
@@ -434,6 +447,107 @@ def flatten_transfer_files(value, username=None):
     return files
 
 
+def safe_path_segments(value):
+    raw = str(value or "").replace("\\", "/")
+    parts = [part for part in raw.split("/") if part not in ("", ".")]
+    if not parts or any(part == ".." or re.match(r"^[A-Za-z]:$", part) for part in parts):
+        return None
+    cleaned = [re.sub(r"[\x00-\x1f]", "", part).strip() for part in parts]
+    return [part for part in cleaned if part] or None
+
+
+def find_completed_file(track, transfer=None):
+    if not SLSKD_DOWNLOADS_PATH or not os.path.isdir(SLSKD_DOWNLOADS_PATH):
+        return None
+    root = pathlib.Path(SLSKD_DOWNLOADS_PATH).resolve()
+    expected_parts = safe_path_segments(track["filename"])
+    if not expected_parts:
+        return None
+    size = int(track["filesize"] or 0)
+    if transfer and transfer.get("localPath"):
+        local = pathlib.Path(str(transfer["localPath"]))
+        choices = [local] if local.is_absolute() else [root / local]
+        for candidate in choices:
+            try:
+                resolved = candidate.resolve()
+                if resolved.is_relative_to(root) and resolved.is_file() and (not size or resolved.stat().st_size == size):
+                    return resolved
+            except (OSError, ValueError):
+                pass
+    expected = (root / pathlib.Path(*expected_parts)).resolve()
+    if expected.is_relative_to(root) and expected.is_file() and (not size or expected.stat().st_size == size):
+        return expected
+    # slskd may prepend a peer or destination directory; only accept one unambiguous file.
+    target_name = expected_parts[-1].casefold()
+    matches = []
+    for folder, _, names in os.walk(root):
+        for name in names:
+            if name.casefold() != target_name:
+                continue
+            candidate = pathlib.Path(folder) / name
+            try:
+                if not size or candidate.stat().st_size == size:
+                    matches.append(candidate.resolve())
+                    if len(matches) > 1:
+                        return None
+            except OSError:
+                continue
+    return matches[0] if matches else None
+
+
+def move_completed_file(track, transfer=None):
+    if not SLSKD_DOWNLOADS_PATH or not DOWNLOAD_DESTINATION_PATH:
+        return None
+    def defer_move(message):
+        attempts = int(track["move_attempts"] or 0) + 1
+        values = {"move_attempts": attempts}
+        if attempts == 1:
+            values["result"] = message
+        update_track(track["id"], **values)
+
+    if not os.path.isdir(SLSKD_DOWNLOADS_PATH):
+        defer_move(f"Скачано · папка загрузок недоступна: {SLSKD_DOWNLOADS_PATH}")
+        return None
+    source = find_completed_file(track, transfer)
+    if not source:
+        defer_move("Скачано · ожидается файл в папке завершённых загрузок slskd")
+        return None
+    remote_parts = safe_path_segments(track["filename"])
+    username_parts = safe_path_segments(track["username"] or "peer")
+    if not remote_parts or not username_parts:
+        return None
+    destination_root = pathlib.Path(DOWNLOAD_DESTINATION_PATH).resolve()
+    relative = pathlib.PurePosixPath(username_parts[-1], *remote_parts)
+    destination = (destination_root / pathlib.Path(*relative.parts)).resolve()
+    if not destination.is_relative_to(destination_root):
+        return None
+    try:
+        if source != destination:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                if filecmp.cmp(source, destination, shallow=False):
+                    source.unlink()
+                else:
+                    stem, suffix = destination.stem, destination.suffix
+                    index = 2
+                    while destination.exists():
+                        destination = destination.with_name(f"{stem} ({index}){suffix}")
+                        index += 1
+                    shutil.move(str(source), str(destination))
+            else:
+                shutil.move(str(source), str(destination))
+        local_path = destination.relative_to(destination_root).as_posix()
+        update_track(track["id"], local_path=local_path, move_attempts=0,
+                     result=f"Скачано · перемещено в {local_path}")
+        with connect() as db:
+            db.execute("UPDATE recommendation_items SET local_path=? WHERE track_id=?", (local_path, track["id"]))
+        return local_path
+    except OSError as exc:
+        app.logger.warning("Could not move completed download %s: %s", track["id"], exc)
+        defer_move(f"Скачано · ошибка переноса: {str(exc)[:220]}")
+        return None
+
+
 def enqueue_download(track_id):
     with connect() as db:
         track = db.execute("SELECT * FROM tracks WHERE id=?", (track_id,)).fetchone()
@@ -500,8 +614,10 @@ def transfer_monitor():
                                  download_state=state,
                                  result=f"{state}{progress} · {track['filename']}",
                                  error=None if status != "download_error" else state)
-                    if status == "downloaded" and track["recommendation_id"]:
-                        sync_navidrome_playlist()
+                    if status == "downloaded":
+                        moved = move_completed_file(track, transfer)
+                        if moved and track["recommendation_id"]:
+                            sync_navidrome_playlist()
         except Exception as exc:
             app.logger.warning("Download status polling failed: %s", exc)
         time.sleep(4)
@@ -510,13 +626,14 @@ def transfer_monitor():
 def recommendation_playlist_monitor():
     while True:
         try:
-            if NAVIDROME_MUSIC_PATH and NAVIDROME_PLAYLIST_PATH:
+            if SLSKD_DOWNLOADS_PATH and DOWNLOAD_DESTINATION_PATH:
                 with connect() as db:
-                    unresolved = db.execute("""SELECT COUNT(*) FROM recommendation_items ri
-                        JOIN tracks t ON t.id=ri.track_id
-                        WHERE ri.playlist_id=? AND t.status='downloaded' AND ri.local_path IS NULL""",
-                                            (RECENT_PLAYLIST_ID,)).fetchone()[0]
-                if unresolved:
+                    pending = db.execute("SELECT * FROM tracks WHERE status='downloaded' AND local_path IS NULL AND move_attempts<10").fetchall()
+                moved_any = False
+                for track in pending:
+                    if move_completed_file(track):
+                        moved_any = True
+                if moved_any:
                     sync_navidrome_playlist()
         except Exception as exc:
             app.logger.warning("Navidrome playlist sync failed: %s", exc)
