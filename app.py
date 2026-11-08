@@ -56,6 +56,7 @@ NAVIDROME_PLAYLIST_PATH = os.environ.get("NAVIDROME_PLAYLIST_PATH", "").strip()
 SLSKD_DOWNLOADS_PATH = os.environ.get("SLSKD_DOWNLOADS_PATH", "").strip()
 DOWNLOAD_DESTINATION_PATH = os.environ.get("DOWNLOAD_DESTINATION_PATH", "").strip()
 RECENT_PLAYLIST_ID = "recent_tracks"
+RECENT_PLAYLIST_NAME = "Похожие на недавние прослушивания"
 
 
 def connect():
@@ -203,18 +204,17 @@ def lastfm_recommendations(body):
         if mode == "top_tracks":
             seeds = lastfm_items(lastfm_call("user.getTopTracks", {"user": user, "period": period, "limit": 8}), "toptracks", "track")
         elif mode == "recent_tracks":
-            recent = lastfm_items(lastfm_call("user.getRecentTracks", {"user": user, "limit": 100}), "recenttracks", "track")
-            found = [{"artist": lastfm_artist_name(item.get("artist")),
-                      "title": item.get("name", ""), "match": None, "source": "Недавние прослушивания",
-                      "url": item.get("url", ""), "type": "track"} for item in recent]
-            seeds = []
+            seeds = lastfm_items(lastfm_call("user.getRecentTracks", {"user": user, "limit": 100}), "recenttracks", "track")
+            seeds = [seed for seed in seeds
+                     if seed.get("name") and lastfm_artist_name(seed.get("artist", {}))]
+            seeds = [random.choice(seeds)] if seeds else []
         else:
             seeds = lastfm_items(lastfm_call("user.getLovedTracks", {"user": user, "limit": 8}), "lovedtracks", "track")
         for seed in seeds[:8]:
             artist_name = lastfm_artist_name(seed.get("artist", {}))
             track_name = seed.get("name", "")
             if artist_name and track_name:
-                similar = lastfm_items(lastfm_call("track.getSimilar", {"artist": artist_name, "track": track_name, "limit": candidate_limit, "autocorrect": 1}), "similartracks", "track")
+                similar = lastfm_items(lastfm_call("track.getSimilar", {"artist": artist_name, "track": track_name, "limit": 100 if mode == "recent_tracks" else candidate_limit, "autocorrect": 1}), "similartracks", "track")
                 found.extend({"artist": lastfm_artist_name(item.get("artist")),
                               "title": item.get("name", ""), "match": item.get("match"), "source": f"Похоже на {artist_name} — {track_name}", "url": item.get("url", ""), "type": "track"} for item in similar)
     elif mode == "top_artists":
@@ -273,7 +273,7 @@ def store_recent_recommendations(items):
     with connect() as db:
         db.execute("INSERT INTO recommendation_playlists(id,name,category,updated) VALUES(?,?,?,?) "
                    "ON CONFLICT(id) DO UPDATE SET name=excluded.name,updated=excluded.updated",
-                   (RECENT_PLAYLIST_ID, "Похожие на недавние прослушивания", RECENT_PLAYLIST_ID, now))
+                   (RECENT_PLAYLIST_ID, RECENT_PLAYLIST_NAME, RECENT_PLAYLIST_ID, now))
         ids = []
         for position, item in enumerate(items):
             item_id = recommendation_item_id(item, RECENT_PLAYLIST_ID)
@@ -301,7 +301,7 @@ def _write_navidrome_playlist():
         return
     playlist_dir = pathlib.Path(NAVIDROME_PLAYLIST_PATH)
     playlist_dir.mkdir(parents=True, exist_ok=True)
-    output = playlist_dir / "Last.fm - Recent recommendations.m3u"
+    output = playlist_dir / f"{RECENT_PLAYLIST_NAME}.m3u"
     root = pathlib.Path(NAVIDROME_MUSIC_PATH).resolve()
     media_by_stem = {}
     for folder, _, names in os.walk(root):
@@ -339,6 +339,9 @@ def _write_navidrome_playlist():
     temporary = output.with_suffix(output.suffix + ".tmp")
     temporary.write_text(content, encoding="utf-8-sig", newline="\n")
     os.replace(temporary, output)
+    legacy_output = playlist_dir / "Last.fm - Recent recommendations.m3u"
+    if legacy_output != output:
+        legacy_output.unlink(missing_ok=True)
 
 
 def sync_navidrome_playlist():
@@ -508,18 +511,27 @@ def move_completed_file(track, transfer=None):
     if not os.path.isdir(SLSKD_DOWNLOADS_PATH):
         defer_move(f"Скачано · папка загрузок недоступна: {SLSKD_DOWNLOADS_PATH}")
         return None
-    source = find_completed_file(track, transfer)
+    remote_parts = safe_path_segments(track["filename"])
+    if not remote_parts:
+        return None
+    destination_root = pathlib.Path(DOWNLOAD_DESTINATION_PATH).resolve()
+    folder_name = RECENT_PLAYLIST_NAME if track["recommendation_id"] else "Загрузки"
+    relative = pathlib.PurePosixPath(folder_name, remote_parts[-1])
+    destination = (destination_root / pathlib.Path(*relative.parts)).resolve()
+    if not destination.is_relative_to(destination_root):
+        return None
+    old_local_path = track["local_path"]
+    source = None
+    if old_local_path:
+        existing = (destination_root / pathlib.PurePosixPath(old_local_path)).resolve()
+        if existing.is_relative_to(destination_root) and existing.is_file():
+            source = existing
+    if not source:
+        source = find_completed_file(track, transfer)
     if not source:
         defer_move("Скачано · ожидается файл в папке завершённых загрузок slskd")
         return None
-    remote_parts = safe_path_segments(track["filename"])
-    username_parts = safe_path_segments(track["username"] or "peer")
-    if not remote_parts or not username_parts:
-        return None
-    destination_root = pathlib.Path(DOWNLOAD_DESTINATION_PATH).resolve()
-    relative = pathlib.PurePosixPath(username_parts[-1], *remote_parts)
-    destination = (destination_root / pathlib.Path(*relative.parts)).resolve()
-    if not destination.is_relative_to(destination_root):
+    if source == destination and old_local_path == relative.as_posix():
         return None
     try:
         if source != destination:
@@ -628,7 +640,7 @@ def recommendation_playlist_monitor():
         try:
             if SLSKD_DOWNLOADS_PATH and DOWNLOAD_DESTINATION_PATH:
                 with connect() as db:
-                    pending = db.execute("SELECT * FROM tracks WHERE status='downloaded' AND local_path IS NULL AND move_attempts<10").fetchall()
+                    pending = db.execute("SELECT * FROM tracks WHERE status='downloaded' AND move_attempts<10").fetchall()
                 moved_any = False
                 for track in pending:
                     if move_completed_file(track):
