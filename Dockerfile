@@ -9,3 +9,4 @@ COPY static ./static
 RUN mkdir -p /data
 EXPOSE 8090
 CMD ["gunicorn", "--workers", "1", "--threads", "16", "--bind", "0.0.0.0:8090", "--access-logfile", "-", "app:app"]
+

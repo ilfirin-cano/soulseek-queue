@@ -2,6 +2,7 @@ import contextlib
 import hashlib
 import json
 import os
+import pathlib
 import random
 import sqlite3
 import threading
@@ -35,6 +36,7 @@ DEFAULTS = {
 lock = threading.Lock()
 search_post_lock = threading.Lock()
 download_post_lock = threading.Lock()
+playlist_sync_lock = threading.Lock()
 pause_event = threading.Event()
 queue_event = threading.Event()
 pool = ThreadPoolExecutor(max_workers=32)
@@ -46,6 +48,9 @@ lastfm_last_request = 0.0
 active = 0
 stop_epoch = 0
 AUDIO_EXTS = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wav", ".aiff", ".wma"}
+NAVIDROME_MUSIC_PATH = os.environ.get("NAVIDROME_MUSIC_PATH", "").strip()
+NAVIDROME_PLAYLIST_PATH = os.environ.get("NAVIDROME_PLAYLIST_PATH", "").strip()
+RECENT_PLAYLIST_ID = "recent_tracks"
 
 
 def connect():
@@ -67,6 +72,15 @@ def init_db():
             search_started_at REAL, batch_id TEXT, download_enabled INTEGER NOT NULL DEFAULT 1,
             download_id TEXT, download_requested_at REAL, download_state TEXT,
             filesize INTEGER NOT NULL DEFAULT 0)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS recommendation_playlists (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL,
+            updated REAL NOT NULL)""")
+        db.execute("""CREATE TABLE IF NOT EXISTS recommendation_items (
+            id TEXT PRIMARY KEY, playlist_id TEXT NOT NULL, artist TEXT NOT NULL,
+            title TEXT NOT NULL, match REAL, source TEXT, url TEXT, position INTEGER NOT NULL,
+            track_id TEXT, local_path TEXT, created REAL NOT NULL,
+            FOREIGN KEY(playlist_id) REFERENCES recommendation_playlists(id),
+            FOREIGN KEY(track_id) REFERENCES tracks(id))""")
         existing = {row["name"] for row in db.execute("PRAGMA table_info(tracks)")}
         if "first_pass_seconds" not in existing:
             db.execute("ALTER TABLE tracks ADD COLUMN first_pass_seconds REAL")
@@ -86,6 +100,8 @@ def init_db():
             db.execute("ALTER TABLE tracks ADD COLUMN download_state TEXT")
         if "filesize" not in existing:
             db.execute("ALTER TABLE tracks ADD COLUMN filesize INTEGER NOT NULL DEFAULT 0")
+        if "recommendation_id" not in existing:
+            db.execute("ALTER TABLE tracks ADD COLUMN recommendation_id TEXT")
         for key, value in DEFAULTS.items():
             db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (key, str(value)))
         # Requeue work interrupted by a container restart and preserve the search batch.
@@ -232,6 +248,89 @@ def lastfm_recommendations(body):
     with lastfm_cache_lock:
         lastfm_cache[cache_key] = (now, deduped)
     return deduped
+
+
+def recommendation_item_id(item, playlist_id=RECENT_PLAYLIST_ID):
+    key = "\0".join((playlist_id, item.get("artist", "").strip().casefold(), item.get("title", "").strip().casefold()))
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+
+
+def store_recent_recommendations(items):
+    now = time.time()
+    with connect() as db:
+        db.execute("INSERT INTO recommendation_playlists(id,name,category,updated) VALUES(?,?,?,?) "
+                   "ON CONFLICT(id) DO UPDATE SET name=excluded.name,updated=excluded.updated",
+                   (RECENT_PLAYLIST_ID, "Похожие на недавние прослушивания", RECENT_PLAYLIST_ID, now))
+        ids = []
+        for position, item in enumerate(items):
+            item_id = recommendation_item_id(item, RECENT_PLAYLIST_ID)
+            ids.append(item_id)
+            db.execute("""INSERT INTO recommendation_items
+                (id,playlist_id,artist,title,match,source,url,position,created)
+                VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+                playlist_id=excluded.playlist_id,artist=excluded.artist,title=excluded.title,
+                match=excluded.match,source=excluded.source,url=excluded.url,
+                position=excluded.position,created=excluded.created""",
+                       (item_id, RECENT_PLAYLIST_ID, item.get("artist", ""), item.get("title", ""),
+                        item.get("match"), item.get("source", ""), item.get("url", ""), position, now))
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            db.execute(f"DELETE FROM recommendation_items WHERE playlist_id=? AND id NOT IN ({placeholders})",
+                       [RECENT_PLAYLIST_ID, *ids])
+        else:
+            db.execute("DELETE FROM recommendation_items WHERE playlist_id=?", (RECENT_PLAYLIST_ID,))
+    sync_navidrome_playlist()
+
+
+def _write_navidrome_playlist():
+    """Write the Navidrome-owned M3U source from recommendation rows with local media."""
+    if not NAVIDROME_MUSIC_PATH or not NAVIDROME_PLAYLIST_PATH:
+        return
+    playlist_dir = pathlib.Path(NAVIDROME_PLAYLIST_PATH)
+    playlist_dir.mkdir(parents=True, exist_ok=True)
+    output = playlist_dir / "Last.fm - Recent recommendations.m3u"
+    root = pathlib.Path(NAVIDROME_MUSIC_PATH).resolve()
+    media_by_stem = {}
+    for folder, _, names in os.walk(root):
+        for name in names:
+            path = pathlib.Path(folder) / name
+            if path.suffix.lower() in AUDIO_EXTS:
+                media_by_stem.setdefault(normalize(path.stem), []).append(path)
+    with connect() as db:
+        rows = db.execute("""SELECT ri.id,ri.artist,ri.title,ri.position,ri.local_path,
+            t.filename,t.status FROM recommendation_items ri
+            LEFT JOIN tracks t ON t.id=ri.track_id
+            WHERE ri.playlist_id=? ORDER BY ri.position""", (RECENT_PLAYLIST_ID,)).fetchall()
+        lines = ["#EXTM3U"]
+        for row in rows:
+            relative = row["local_path"]
+            if relative:
+                candidate = (root / pathlib.PurePosixPath(relative)).resolve()
+                if not candidate.is_relative_to(root) or not candidate.is_file():
+                    relative = None
+            if not relative:
+                remote_base = normalize(os.path.splitext(os.path.basename(str(row["filename"] or "").replace("\\", "/")))[0])
+                artist_title = normalize(f"{row['artist']} {row['title']}")
+                title = normalize(row["title"])
+                candidates = media_by_stem.get(remote_base, []) if remote_base else []
+                if not candidates:
+                    candidates = media_by_stem.get(artist_title, []) or media_by_stem.get(title, [])
+                if len(candidates) == 1:
+                    relative = candidates[0].relative_to(root).as_posix()
+                if relative:
+                    db.execute("UPDATE recommendation_items SET local_path=? WHERE id=?", (relative, row["id"]))
+            if relative:
+                label = " - ".join(part for part in (row["artist"], row["title"]) if part)
+                lines.extend((f"#EXTINF:-1,{label}", relative.replace("\\", "/")))
+    content = "\n".join(lines) + "\n"
+    temporary = output.with_suffix(output.suffix + ".tmp")
+    temporary.write_text(content, encoding="utf-8-sig", newline="\n")
+    os.replace(temporary, output)
+
+
+def sync_navidrome_playlist():
+    with playlist_sync_lock:
+        _write_navidrome_playlist()
 
 
 def api_request(method, path, **kwargs):
@@ -401,9 +500,27 @@ def transfer_monitor():
                                  download_state=state,
                                  result=f"{state}{progress} · {track['filename']}",
                                  error=None if status != "download_error" else state)
+                    if status == "downloaded" and track["recommendation_id"]:
+                        sync_navidrome_playlist()
         except Exception as exc:
             app.logger.warning("Download status polling failed: %s", exc)
         time.sleep(4)
+
+
+def recommendation_playlist_monitor():
+    while True:
+        try:
+            if NAVIDROME_MUSIC_PATH and NAVIDROME_PLAYLIST_PATH:
+                with connect() as db:
+                    unresolved = db.execute("""SELECT COUNT(*) FROM recommendation_items ri
+                        JOIN tracks t ON t.id=ri.track_id
+                        WHERE ri.playlist_id=? AND t.status='downloaded' AND ri.local_path IS NULL""",
+                                            (RECENT_PLAYLIST_ID,)).fetchone()[0]
+                if unresolved:
+                    sync_navidrome_playlist()
+        except Exception as exc:
+            app.logger.warning("Navidrome playlist sync failed: %s", exc)
+        time.sleep(30)
 
 
 def process_track(track_id):
@@ -600,17 +717,36 @@ def add_tracks():
     start = bool(body.get("start", True))
     resumed = pause_event.is_set() and start
     status = "queued" if start else "staged"
+    recommendation_ids = body.get("recommendation_ids", [])
+    if not isinstance(recommendation_ids, list):
+        recommendation_ids = []
+    recommendation_ids = [str(value) for value in recommendation_ids]
+    added = 0
+    skipped = 0
     with lock:
         if start:
             pause_event.clear()
         with connect() as db:
-            for line in lines:
+            for index, line in enumerate(lines):
                 # Each line may be `Artist - Track`; arbitrary query text is also accepted.
-                db.execute("INSERT INTO tracks(id,title,query,status,created,updated,batch_id,download_enabled) VALUES(?,?,?,?,?,?,?,?)",
-                           (str(uuid.uuid4()), line, line, status, now, now, batch_id, download_enabled))
+                recommendation_id = recommendation_ids[index] if index < len(recommendation_ids) else None
+                if recommendation_id:
+                    existing_rec = db.execute("SELECT track_id FROM recommendation_items WHERE id=?", (recommendation_id,)).fetchone()
+                    if existing_rec and existing_rec["track_id"]:
+                        skipped += 1
+                        continue
+                track_id = str(uuid.uuid4())
+                db.execute("INSERT INTO tracks(id,title,query,status,created,updated,batch_id,download_enabled,recommendation_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                           (track_id, line, line, status, now, now, batch_id, download_enabled, recommendation_id))
+                if recommendation_id:
+                    db.execute("UPDATE recommendation_items SET track_id=? WHERE id=?",
+                               (track_id, recommendation_id))
+                added += 1
     if start:
         queue_event.set()
-    return jsonify(added=len(lines), resumed=resumed, staged=not start)
+    if recommendation_ids:
+        sync_navidrome_playlist()
+    return jsonify(added=added, skipped=skipped, resumed=resumed, staged=not start)
 
 
 @app.delete("/api/tracks")
@@ -801,15 +937,51 @@ def delete_lastfm_session():
 @app.post("/api/lastfm/recommendations")
 def get_lastfm_recommendations():
     try:
-        return jsonify(items=lastfm_recommendations(request.get_json(silent=True) or {}))
+        body = request.get_json(silent=True) or {}
+        items = lastfm_recommendations(body)
+        playlist_id = None
+        if body.get("mode") == RECENT_PLAYLIST_ID:
+            store_recent_recommendations(items)
+            playlist_id = RECENT_PLAYLIST_ID
+            for item in items:
+                item["id"] = recommendation_item_id(item, RECENT_PLAYLIST_ID)
+        return jsonify(items=items, playlist_id=playlist_id)
     except Exception as exc:
         return jsonify(error=str(exc)), 400
+
+
+@app.get("/api/lastfm/playlists/recent-tracks")
+def get_recent_recommendation_playlist():
+    with connect() as db:
+        playlist = db.execute("SELECT * FROM recommendation_playlists WHERE id=?", (RECENT_PLAYLIST_ID,)).fetchone()
+        if not playlist:
+            return jsonify(id=RECENT_PLAYLIST_ID, name="Похожие на недавние прослушивания", items=[], updated_at=None)
+        rows = db.execute("""SELECT ri.*,t.status AS download_status,t.download_state,
+            t.result AS download_result FROM recommendation_items ri
+            LEFT JOIN tracks t ON t.id=ri.track_id WHERE ri.playlist_id=? ORDER BY ri.position""",
+                          (RECENT_PLAYLIST_ID,)).fetchall()
+    items = []
+    music_root = pathlib.Path(NAVIDROME_MUSIC_PATH).resolve() if NAVIDROME_MUSIC_PATH else None
+    for row in rows:
+        item = dict(row)
+        available = False
+        if item.get("local_path") and music_root:
+            candidate = (music_root / pathlib.PurePosixPath(item["local_path"])).resolve()
+            available = candidate.is_relative_to(music_root) and candidate.is_file()
+        item["available"] = available
+        item["state"] = "available" if item["available"] else item.get("download_status") or "recommended"
+        items.append(item)
+    return jsonify(id=playlist["id"], name=playlist["name"], category=playlist["category"],
+                   updated_at=playlist["updated"], items=items)
 
 
 init_db()
 queue_event.set()
 threading.Thread(target=scheduler, daemon=True, name="track-scheduler").start()
 threading.Thread(target=transfer_monitor, daemon=True, name="transfer-monitor").start()
+threading.Thread(target=recommendation_playlist_monitor, daemon=True, name="recommendation-playlist-monitor").start()
+threading.Thread(target=sync_navidrome_playlist, daemon=True, name="navidrome-playlist-startup-sync").start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8090")))
+

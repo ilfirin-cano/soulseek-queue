@@ -19,9 +19,12 @@ services:
       LASTFM_SHARED_SECRET: ${LASTFM_SHARED_SECRET:-}
       LASTFM_USERNAME: ${LASTFM_USERNAME:-}
       LASTFM_PROXY_URL: ${LASTFM_PROXY_URL:-}
+      NAVIDROME_MUSIC_PATH: ${NAVIDROME_MUSIC_PATH:-}
+      NAVIDROME_PLAYLIST_PATH: ${NAVIDROME_PLAYLIST_PATH:-}
     volumes:
       - soulseek_queue_data:/data
     # Put this service on the same Docker network as slskd, or set SLSKD_URL
     # to a host-reachable address such as http://host.docker.internal:5030.
 volumes:
   soulseek_queue_data:
+
