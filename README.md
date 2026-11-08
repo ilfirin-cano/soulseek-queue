@@ -35,26 +35,29 @@ POST-запросы создания поиска и постановки ска
 
 Доступны четыре варианта персональных рекомендаций: похожие треки на ваши топ-треки за выбранный период; похожие треки на недавно прослушанные; похожие треки на отмеченные любимыми; популярные треки исполнителей, похожих на ваших топ-исполнителей. Также можно получить топ треков или исполнителей по тегу/жанру и похожих исполнителей или треки для введённой пары «исполнитель — трек». Last.fm предоставляет для этого отдельные методы чартов, похожих артистов и треков, а также теговые чарты; приложение объединяет ответы, удаляет дубликаты и позволяет добавить выбранное в очередь.
 
-Рекомендации основаны на методах [`user.getTopTracks`](https://www.last.fm/api/show/user.getTopTracks), [`user.getRecentTracks`](https://www.last.fm/api/show/user.getRecentTracks), [`user.getLovedTracks`](https://www.last.fm/api/show/user.getLovedTracks), [`artist.getSimilar`](https://www.last.fm/api/show/artist.getSimilar), [`track.getSimilar`](https://www.last.fm/api/show/track.getSimilar) и [`tag.getTopTracks`](https://www.last.fm/api/show/tag.getTopTracks). Last.fm API просит использовать разумную частоту запросов, поэтому вызовы выполняются последовательно и результаты кэшируются на 10 минут. Рекомендации можно запустить сразу или отложить в очередь и начать поиск позже кнопкой «Запустить отложенные».
+Рекомендации основаны на методах [`user.getTopTracks`](https://www.last.fm/api/show/user.getTopTracks), [`user.getRecentTracks`](https://www.last.fm/api/show/user.getRecentTracks), [`user.getLovedTracks`](https://www.last.fm/api/show/user.getLovedTracks), [`artist.getSimilar`](https://www.last.fm/api/show/artist.getSimilar), [`track.getSimilar`](https://www.last.fm/api/show/track.getSimilar) и [`tag.getTopTracks`](https://www.last.fm/api/show/tag.getTopTracks). Last.fm API просит использовать разумную частоту запросов, поэтому вызовы выполняются последовательно; рекомендации для категорий, кроме недавних прослушиваний, кэшируются на 10 минут. Для недавних прослушиваний при каждом обновлении Last.fm запрашивает 50 последних треков, случайно выбирает один как затравку и запрашивает до 100 похожих треков. Затем приложение случайно выбирает из них заданное количество. Если Last.fm вернул меньше нужного числа, показываются все полученные рекомендации. Рекомендации можно запустить сразу или отложить в очередь и начать поиск позже кнопкой «Запустить отложенные».
 
 ### Плейлист рекомендаций в Navidrome
 
 При запросе категории «Похожие на недавние прослушивания» результаты сразу сохраняются в SQLite. Их можно получить отдельно от очереди скачивания через `GET /api/lastfm/playlists/recent-tracks`; в ответе есть исходная информация рекомендации, состояние загрузки и `available`/`local_path`. У выбранных рекомендаций сохраняется связь с записью очереди, поэтому повторная отправка той же рекомендации не создаёт второй элемент.
 
-Чтобы Navidrome увидел плейлист, подключите одну и ту же музыку к slskd, soulseek-queue и Navidrome. В контейнере очереди задайте `NAVIDROME_MUSIC_PATH=/music` и `NAVIDROME_PLAYLIST_PATH=/playlists`. Пример монтирования в `soulseek-queue` (пути хоста замените своими):
+После успешной загрузки soulseek-queue перемещает файл из завершённой папки slskd в `/srv/soulseek/playlists` на хосте. В `.env` задайте `SLSKD_DOWNLOADS_HOST_PATH` — хостовый путь к завершённым загрузкам slskd. Он должен быть одной и той же папкой, примонтированной в slskd как `/downloads` и в soulseek-queue как `/downloads`. В slskd укажите `SLSKD_DOWNLOADS_DIR=/downloads` (или `directories.downloads: /downloads`).
 
 ```yaml
 services:
+  slskd:
+    volumes:
+      - /srv/soulseek/downloads:/downloads
   soulseek-queue:
     volumes:
       - soulseek_queue_data:/data
-      - /srv/music:/music:ro
-      - /srv/music/Playlists:/playlists
+      - /srv/soulseek/downloads:/downloads
+      - /srv/soulseek/playlists:/playlists
 ```
 
-Navidrome должен видеть `/srv/music` как `MusicFolder` и `/srv/music/Playlists` как `PlaylistsPath=Playlists`, с включённым `AutoImportPlaylists`. Например, в его Compose подключите `/srv/music:/music:ro`; папку плейлистов он уже увидит внутри `/music/Playlists`. Каталог с плейлистом должен быть доступен на запись контейнеру очереди и на чтение Navidrome. slskd должен скачивать в ту же медиатеку.
+В Navidrome примонтируйте ту же целевую папку как библиотеку, например `/srv/soulseek/playlists:/music:ro`, установите `MusicFolder=/music`, `PlaylistsPath=.` и включите `AutoImportPlaylists`. Для `soulseek-queue` в `.env` используются `DOWNLOAD_DESTINATION_PATH=/playlists`, `NAVIDROME_MUSIC_PATH=/playlists` и `NAVIDROME_PLAYLIST_PATH=/playlists`. Папка плейлистов должна быть доступна на запись очереди и на чтение Navidrome.
 
-Файл `Last.fm - Recent recommendations.m3u` является источником синхронизируемого плейлиста Navidrome. Он содержит только уже существующие аудиофайлы из медиатеки: Navidrome не может представить ещё не скачанные рекомендации как воспроизводимые треки. Полный список и ожидающие загрузки остаются доступны через endpoint очереди. После завершения загрузки очередь ищет однозначное совпадение по пути или точному имени файла, сохраняет относительный путь и обновляет M3U атомарно; автоматический импорт Navidrome подхватывает изменения при сканировании библиотеки. Для новых рекомендаций содержимое плейлиста заменяется актуальным снимком категории. Повторно скачанные/обновлённые рекомендации не дублируются.
+После статуса `Completed, Succeeded` приложение ищет готовый файл в смонтированной папке slskd, безопасно перемещает его под `/playlists/<пользователь>/<путь из Soulseek>` и сохраняет новый относительный путь. При одинаковых именах добавляется суффикс, чтобы не затереть файл. Если slskd сообщил о завершении раньше, чем файл стал виден, перенос повторяется фоново. Файл `Last.fm - Recent recommendations.m3u` остаётся источником синхронизируемого плейлиста Navidrome и обновляется с относительными путями уже перемещённых файлов. Сам список рекомендаций и состояния ожидания доступны сразу через `GET /api/lastfm/playlists/recent-tracks`; Navidrome показывает только уже скачанные и просканированные файлы.
 
 Чтобы направлять через Gluetun только API-запросы Last.fm, включите в нём `HTTPPROXY=on`, разрешите порт `8888` во входном firewall (`FIREWALL_INPUT_PORTS=8888`) и задайте приложению `LASTFM_PROXY_URL=http://gluetun:8888`. Оба контейнера должны быть подключены к одной Docker-сети; если Compose-проекты разные, подключите их к общей внешней сети. В этом варианте не задавайте приложению `network_mode`: его веб-порт остаётся на `8090`, а связь со slskd сохраняется.
 
