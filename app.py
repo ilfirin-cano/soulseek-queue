@@ -308,6 +308,16 @@ def _write_navidrome_playlist():
     playlist_dir.mkdir(parents=True, exist_ok=True)
     output = playlist_dir / f"{RECENT_PLAYLIST_NAME}.m3u"
     root = pathlib.Path(NAVIDROME_MUSIC_PATH).resolve()
+    recommendation_dir = (root / RECENT_PLAYLIST_NAME).resolve()
+    recommendation_files = []
+    if recommendation_dir.is_relative_to(root) and recommendation_dir.is_dir():
+        for folder, _, names in os.walk(recommendation_dir):
+            for name in names:
+                if pathlib.Path(name).suffix.lower() not in AUDIO_EXTS:
+                    continue
+                candidate = (pathlib.Path(folder) / name).resolve()
+                if candidate.is_relative_to(root) and candidate.is_file():
+                    recommendation_files.append(candidate)
     media_by_stem = {}
     for folder, _, names in os.walk(root):
         for name in names:
@@ -320,6 +330,11 @@ def _write_navidrome_playlist():
             LEFT JOIN tracks t ON t.id=ri.track_id
             WHERE ri.playlist_id=? ORDER BY ri.position""", (RECENT_PLAYLIST_ID,)).fetchall()
         lines = ["#EXTM3U"]
+        included_paths = set()
+        for path in recommendation_files:
+            relative = path.resolve().relative_to(root).as_posix()
+            included_paths.add(relative.casefold())
+            lines.extend((f"#EXTINF:-1,{path.stem}", relative))
         for row in rows:
             relative = None
             # Prefer the queue path: the recommendation row may still have an old location.
@@ -341,7 +356,8 @@ def _write_navidrome_playlist():
                     relative = candidates[0].relative_to(root).as_posix()
             if relative and row["local_path"] != relative:
                 db.execute("UPDATE recommendation_items SET local_path=? WHERE id=?", (relative, row["id"]))
-            if relative:
+            if relative and relative.casefold() not in included_paths:
+                included_paths.add(relative.casefold())
                 label = " - ".join(part for part in (row["artist"], row["title"]) if part)
                 lines.extend((f"#EXTINF:-1,{label}", relative.replace("\\", "/")))
     content = "\n".join(lines) + "\n"
@@ -351,6 +367,7 @@ def _write_navidrome_playlist():
     legacy_output = playlist_dir / "Last.fm - Recent recommendations.m3u"
     if legacy_output != output:
         legacy_output.unlink(missing_ok=True)
+    app.logger.info("Updated Navidrome playlist with %d tracks", len(included_paths))
     return True
 
 
