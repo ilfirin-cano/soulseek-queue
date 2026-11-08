@@ -40,8 +40,10 @@ lock = threading.Lock()
 search_post_lock = threading.Lock()
 download_post_lock = threading.Lock()
 playlist_sync_lock = threading.Lock()
+file_move_lock = threading.Lock()
 pause_event = threading.Event()
 queue_event = threading.Event()
+navidrome_scan_event = threading.Event()
 pool = ThreadPoolExecutor(max_workers=32)
 download_pool = ThreadPoolExecutor(max_workers=4)
 lastfm_cache = {}
@@ -53,6 +55,9 @@ stop_epoch = 0
 AUDIO_EXTS = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wav", ".aiff", ".wma"}
 NAVIDROME_MUSIC_PATH = os.environ.get("NAVIDROME_MUSIC_PATH", "").strip()
 NAVIDROME_PLAYLIST_PATH = os.environ.get("NAVIDROME_PLAYLIST_PATH", "").strip()
+NAVIDROME_URL = os.environ.get("NAVIDROME_URL", "").strip().rstrip("/")
+NAVIDROME_USERNAME = os.environ.get("NAVIDROME_USERNAME", "").strip()
+NAVIDROME_PASSWORD = os.environ.get("NAVIDROME_PASSWORD", "")
 SLSKD_DOWNLOADS_PATH = os.environ.get("SLSKD_DOWNLOADS_PATH", "").strip()
 DOWNLOAD_DESTINATION_PATH = os.environ.get("DOWNLOAD_DESTINATION_PATH", "").strip()
 RECENT_PLAYLIST_ID = "recent_tracks"
@@ -298,7 +303,7 @@ def store_recent_recommendations(items):
 def _write_navidrome_playlist():
     """Write the Navidrome-owned M3U source from recommendation rows with local media."""
     if not NAVIDROME_MUSIC_PATH or not NAVIDROME_PLAYLIST_PATH:
-        return
+        return False
     playlist_dir = pathlib.Path(NAVIDROME_PLAYLIST_PATH)
     playlist_dir.mkdir(parents=True, exist_ok=True)
     output = playlist_dir / f"{RECENT_PLAYLIST_NAME}.m3u"
@@ -316,11 +321,15 @@ def _write_navidrome_playlist():
             WHERE ri.playlist_id=? ORDER BY ri.position""", (RECENT_PLAYLIST_ID,)).fetchall()
         lines = ["#EXTM3U"]
         for row in rows:
-            relative = row["local_path"] or row["track_local_path"]
-            if relative:
-                candidate = (root / pathlib.PurePosixPath(relative)).resolve()
-                if not candidate.is_relative_to(root) or not candidate.is_file():
-                    relative = None
+            relative = None
+            # Prefer the queue path: the recommendation row may still have an old location.
+            for stored_path in (row["track_local_path"], row["local_path"]):
+                if not stored_path:
+                    continue
+                candidate = (root / pathlib.PurePosixPath(stored_path)).resolve()
+                if candidate.is_relative_to(root) and candidate.is_file():
+                    relative = candidate.relative_to(root).as_posix()
+                    break
             if not relative:
                 remote_base = normalize(os.path.splitext(os.path.basename(str(row["filename"] or "").replace("\\", "/")))[0])
                 artist_title = normalize(f"{row['artist']} {row['title']}")
@@ -330,8 +339,8 @@ def _write_navidrome_playlist():
                     candidates = media_by_stem.get(artist_title, []) or media_by_stem.get(title, [])
                 if len(candidates) == 1:
                     relative = candidates[0].relative_to(root).as_posix()
-                if relative:
-                    db.execute("UPDATE recommendation_items SET local_path=? WHERE id=?", (relative, row["id"]))
+            if relative and row["local_path"] != relative:
+                db.execute("UPDATE recommendation_items SET local_path=? WHERE id=?", (relative, row["id"]))
             if relative:
                 label = " - ".join(part for part in (row["artist"], row["title"]) if part)
                 lines.extend((f"#EXTINF:-1,{label}", relative.replace("\\", "/")))
@@ -342,11 +351,45 @@ def _write_navidrome_playlist():
     legacy_output = playlist_dir / "Last.fm - Recent recommendations.m3u"
     if legacy_output != output:
         legacy_output.unlink(missing_ok=True)
+    return True
 
 
 def sync_navidrome_playlist():
     with playlist_sync_lock:
-        _write_navidrome_playlist()
+        written = _write_navidrome_playlist()
+    if written and NAVIDROME_URL and NAVIDROME_USERNAME and NAVIDROME_PASSWORD:
+        navidrome_scan_event.set()
+
+
+def navidrome_call(method):
+    salt = uuid.uuid4().hex
+    token = hashlib.md5((NAVIDROME_PASSWORD + salt).encode("utf-8")).hexdigest()
+    response = requests.get(
+        f"{NAVIDROME_URL}/rest/{method}.view",
+        params={"u": NAVIDROME_USERNAME, "t": token, "s": salt,
+                "v": "1.16.1", "c": "soulseek-queue", "f": "json"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json().get("subsonic-response", {})
+    if payload.get("status") != "ok":
+        error = payload.get("error", {})
+        raise RuntimeError(f"Navidrome {method}: {error.get('message', payload.get('status', 'unknown error'))}")
+    return payload
+
+
+def navidrome_scan_monitor():
+    while True:
+        navidrome_scan_event.wait()
+        navidrome_scan_event.clear()
+        try:
+            while navidrome_call("getScanStatus").get("scanStatus", {}).get("scanning"):
+                time.sleep(2)
+            navidrome_call("startScan")
+            while navidrome_call("getScanStatus").get("scanStatus", {}).get("scanning"):
+                time.sleep(2)
+        except Exception as exc:
+            app.logger.warning("Could not refresh Navidrome after playlist update: %s", exc)
 
 
 def api_request(method, path, **kwargs):
@@ -499,6 +542,13 @@ def find_completed_file(track, transfer=None):
 
 
 def move_completed_file(track, transfer=None):
+    with file_move_lock:
+        with connect() as db:
+            fresh = db.execute("SELECT * FROM tracks WHERE id=?", (track["id"],)).fetchone()
+        return _move_completed_file_locked(fresh or track, transfer)
+
+
+def _move_completed_file_locked(track, transfer=None):
     if not SLSKD_DOWNLOADS_PATH or not DOWNLOAD_DESTINATION_PATH:
         return None
     def defer_move(message):
@@ -627,8 +677,8 @@ def transfer_monitor():
                                  result=f"{state}{progress} · {track['filename']}",
                                  error=None if status != "download_error" else state)
                     if status == "downloaded":
-                        moved = move_completed_file(track, transfer)
-                        if moved and track["recommendation_id"]:
+                        move_completed_file(track, transfer)
+                        if track["recommendation_id"]:
                             sync_navidrome_playlist()
         except Exception as exc:
             app.logger.warning("Download status polling failed: %s", exc)
@@ -649,7 +699,7 @@ def recommendation_playlist_monitor():
                     sync_navidrome_playlist()
         except Exception as exc:
             app.logger.warning("Navidrome playlist sync failed: %s", exc)
-        time.sleep(30)
+        time.sleep(5)
 
 
 def process_track(track_id):
@@ -1109,6 +1159,7 @@ queue_event.set()
 threading.Thread(target=scheduler, daemon=True, name="track-scheduler").start()
 threading.Thread(target=transfer_monitor, daemon=True, name="transfer-monitor").start()
 threading.Thread(target=recommendation_playlist_monitor, daemon=True, name="recommendation-playlist-monitor").start()
+threading.Thread(target=navidrome_scan_monitor, daemon=True, name="navidrome-scan-monitor").start()
 threading.Thread(target=sync_navidrome_playlist, daemon=True, name="navidrome-playlist-startup-sync").start()
 
 if __name__ == "__main__":
