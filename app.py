@@ -308,15 +308,16 @@ def _write_navidrome_playlist():
     playlist_dir.mkdir(parents=True, exist_ok=True)
     output = playlist_dir / f"{RECENT_PLAYLIST_NAME}.m3u"
     root = pathlib.Path(NAVIDROME_MUSIC_PATH).resolve()
-    recommendation_dir = (root / RECENT_PLAYLIST_NAME).resolve()
+    destination_root = pathlib.Path(DOWNLOAD_DESTINATION_PATH).resolve() if DOWNLOAD_DESTINATION_PATH else root
+    recommendation_dir = (destination_root / RECENT_PLAYLIST_NAME).resolve()
     recommendation_files = []
-    if recommendation_dir.is_relative_to(root) and recommendation_dir.is_dir():
+    if recommendation_dir.is_relative_to(destination_root) and recommendation_dir.is_dir():
         for folder, _, names in os.walk(recommendation_dir):
             for name in names:
                 if pathlib.Path(name).suffix.lower() not in AUDIO_EXTS:
                     continue
                 candidate = (pathlib.Path(folder) / name).resolve()
-                if candidate.is_relative_to(root) and candidate.is_file():
+                if candidate.is_relative_to(destination_root) and candidate.is_file():
                     recommendation_files.append(candidate)
     media_by_stem = {}
     for folder, _, names in os.walk(root):
@@ -332,7 +333,7 @@ def _write_navidrome_playlist():
         lines = ["#EXTM3U"]
         included_paths = set()
         for path in recommendation_files:
-            relative = path.resolve().relative_to(root).as_posix()
+            relative = path.resolve().relative_to(destination_root).as_posix()
             included_paths.add(relative.casefold())
             lines.extend((f"#EXTINF:-1,{path.stem}", relative))
         for row in rows:
@@ -341,9 +342,12 @@ def _write_navidrome_playlist():
             for stored_path in (row["track_local_path"], row["local_path"]):
                 if not stored_path:
                     continue
-                candidate = (root / pathlib.PurePosixPath(stored_path)).resolve()
-                if candidate.is_relative_to(root) and candidate.is_file():
-                    relative = candidate.relative_to(root).as_posix()
+                for media_root in (destination_root, root):
+                    candidate = (media_root / pathlib.PurePosixPath(stored_path)).resolve()
+                    if candidate.is_relative_to(media_root) and candidate.is_file():
+                        relative = candidate.relative_to(media_root).as_posix()
+                        break
+                if relative:
                     break
             if not relative:
                 remote_base = normalize(os.path.splitext(os.path.basename(str(row["filename"] or "").replace("\\", "/")))[0])
@@ -376,6 +380,38 @@ def sync_navidrome_playlist():
         written = _write_navidrome_playlist()
     if written and NAVIDROME_URL and NAVIDROME_USERNAME and NAVIDROME_PASSWORD:
         navidrome_scan_event.set()
+
+
+def append_navidrome_playlist_entry(track, local_path):
+    if not NAVIDROME_PLAYLIST_PATH or not track["recommendation_id"]:
+        return False
+    path = pathlib.PurePosixPath(local_path)
+    if not path.parts or path.parts[0] != RECENT_PLAYLIST_NAME:
+        return False
+    normalized_path = path.as_posix()
+    try:
+        playlist_dir = pathlib.Path(NAVIDROME_PLAYLIST_PATH)
+        playlist_dir.mkdir(parents=True, exist_ok=True)
+        output = playlist_dir / f"{RECENT_PLAYLIST_NAME}.m3u"
+        with playlist_sync_lock:
+            lines = output.read_text(encoding="utf-8-sig").splitlines() if output.is_file() else []
+            if not lines or lines[0].strip() != "#EXTM3U":
+                lines.insert(0, "#EXTM3U")
+            existing = {line.strip().casefold() for line in lines if line.strip() and not line.lstrip().startswith("#")}
+            if normalized_path.casefold() in existing:
+                return False
+            label = track["title"].replace("\r", " ").replace("\n", " ")
+            lines.extend((f"#EXTINF:-1,{label}", normalized_path))
+            temporary = output.with_suffix(output.suffix + ".tmp")
+            temporary.write_text("\n".join(lines) + "\n", encoding="utf-8-sig", newline="\n")
+            os.replace(temporary, output)
+    except OSError as exc:
+        app.logger.warning("Could not add file to Navidrome playlist: %s", exc)
+        return False
+    app.logger.info("Added downloaded file to Navidrome playlist: %s", normalized_path)
+    if NAVIDROME_URL and NAVIDROME_USERNAME and NAVIDROME_PASSWORD:
+        navidrome_scan_event.set()
+    return True
 
 
 def navidrome_call(method):
@@ -599,6 +635,10 @@ def _move_completed_file_locked(track, transfer=None):
         defer_move("Скачано · ожидается файл в папке завершённых загрузок slskd")
         return None
     if source == destination and old_local_path == relative.as_posix():
+        if track["recommendation_id"]:
+            with connect() as db:
+                db.execute("UPDATE recommendation_items SET local_path=? WHERE track_id=?", (relative.as_posix(), track["id"]))
+            append_navidrome_playlist_entry(track, relative.as_posix())
         return None
     try:
         if source != destination:
@@ -620,6 +660,7 @@ def _move_completed_file_locked(track, transfer=None):
                      result=f"Скачано · перемещено в {local_path}")
         with connect() as db:
             db.execute("UPDATE recommendation_items SET local_path=? WHERE track_id=?", (local_path, track["id"]))
+        append_navidrome_playlist_entry(track, local_path)
         return local_path
     except OSError as exc:
         app.logger.warning("Could not move completed download %s: %s", track["id"], exc)
