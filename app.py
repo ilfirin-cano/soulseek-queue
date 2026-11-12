@@ -28,6 +28,8 @@ DEFAULTS = {
     "concurrency": int(os.environ.get("CONCURRENCY", "3")),
     "match_threshold": int(os.environ.get("MATCH_THRESHOLD", "25")),
     "retry_match_threshold": int(os.environ.get("RETRY_MATCH_THRESHOLD", "15")),
+    "download_stall_seconds": int(os.environ.get("DOWNLOAD_STALL_SECONDS", "5")),
+    "download_max_retries": int(os.environ.get("DOWNLOAD_MAX_RETRIES", "5")),
     "retry_enabled": os.environ.get("RETRY_ENABLED", "true").lower() == "true",
     "burst_searches": os.environ.get("BURST_SEARCHES", "false").lower() == "true",
     "lastfm_api_key": os.environ.get("LASTFM_API_KEY", ""),
@@ -83,7 +85,10 @@ def init_db():
             search_started_at REAL, batch_id TEXT, download_enabled INTEGER NOT NULL DEFAULT 1,
             download_id TEXT, download_requested_at REAL, download_state TEXT,
             filesize INTEGER NOT NULL DEFAULT 0, local_path TEXT,
-            move_attempts INTEGER NOT NULL DEFAULT 0)""")
+            move_attempts INTEGER NOT NULL DEFAULT 0,
+            download_state_since REAL,
+            download_attempted_sources TEXT NOT NULL DEFAULT '[]',
+            download_retry_count INTEGER NOT NULL DEFAULT 0)""")
         db.execute("""CREATE TABLE IF NOT EXISTS recommendation_playlists (
             id TEXT PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL,
             updated REAL NOT NULL)""")
@@ -118,8 +123,15 @@ def init_db():
             db.execute("ALTER TABLE tracks ADD COLUMN local_path TEXT")
         if "move_attempts" not in existing:
             db.execute("ALTER TABLE tracks ADD COLUMN move_attempts INTEGER NOT NULL DEFAULT 0")
+        if "download_state_since" not in existing:
+            db.execute("ALTER TABLE tracks ADD COLUMN download_state_since REAL")
+        if "download_attempted_sources" not in existing:
+            db.execute("ALTER TABLE tracks ADD COLUMN download_attempted_sources TEXT NOT NULL DEFAULT '[]'")
+        if "download_retry_count" not in existing:
+            db.execute("ALTER TABLE tracks ADD COLUMN download_retry_count INTEGER NOT NULL DEFAULT 0")
         for key, value in DEFAULTS.items():
             db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (key, str(value)))
+        db.execute("UPDATE settings SET value='5' WHERE key='download_max_retries' AND value='3'")
         # Requeue work interrupted by a container restart and preserve the search batch.
         db.execute("UPDATE tracks SET search_seconds_total=search_seconds_total+MAX(0,CAST(strftime('%s','now') AS REAL)-COALESCE(search_started_at,CAST(strftime('%s','now') AS REAL))), search_started_at=NULL, status=CASE WHEN pass=2 THEN 'retry_queued' WHEN pass=3 THEN 'sequential_queued' ELSE 'queued' END, search_id=NULL WHERE status IN ('claimed','searching','retrying','sequential_searching')")
         db.execute("UPDATE tracks SET batch_id=CAST(created AS TEXT) WHERE batch_id IS NULL")
@@ -131,8 +143,11 @@ def init_db():
 def settings():
     with connect() as db:
         result = {r["key"]: r["value"] for r in db.execute("SELECT key,value FROM settings")}
-    for key in ("search_seconds", "retry_seconds", "concurrency", "match_threshold", "retry_match_threshold"):
+    for key in ("search_seconds", "retry_seconds", "concurrency", "match_threshold", "retry_match_threshold",
+                "download_stall_seconds", "download_max_retries"):
         result[key] = int(result[key])
+    result["download_stall_seconds"] = max(1, min(3600, result["download_stall_seconds"]))
+    result["download_max_retries"] = max(1, min(5, result["download_max_retries"]))
     result["retry_enabled"] = result["retry_enabled"].lower() == "true"
     result["burst_searches"] = result["burst_searches"].lower() == "true"
     return result
@@ -515,9 +530,11 @@ def normalize(value):
     return "".join(char if char.isalnum() else " " for char in value).strip()
 
 
-def choose_file(responses, title):
+def choose_file(responses, title, excluded_sources=None):
     candidates = []
     needle = normalize(title)
+    excluded_sources = {tuple(str(part).casefold() for part in source)
+                        for source in (excluded_sources or []) if isinstance(source, (list, tuple)) and len(source) == 2}
     if not needle:
         return None
     for peer in responses or []:
@@ -528,6 +545,8 @@ def choose_file(responses, title):
             if not isinstance(file, dict):
                 continue
             name = file.get("filename", "")
+            if (str(username or "").casefold(), str(name).replace("\\", "/").casefold()) in excluded_sources:
+                continue
             if os.path.splitext(name)[1].lower() not in AUDIO_EXTS:
                 continue
             basename = os.path.basename(os.path.splitext(name.replace("\\", "/"))[0])
@@ -740,12 +759,64 @@ def schedule_download(track_id):
     return True
 
 
+def recover_download(track, transfer, reason, cancel=True):
+    """Cancel a stuck/failed source and send the track through search for another peer."""
+    transfer_id = transfer.get("id") or track["download_id"]
+    if cancel:
+        if not transfer_id:
+            update_track(track["id"], status="download_error", download_state="Recovery failed",
+                         result=f"Автовосстановление не удалось · у передачи нет ID: {reason}", error=reason)
+            return False
+        username = requests.utils.quote(track["username"] or transfer.get("username", ""), safe="")
+        encoded_id = requests.utils.quote(str(transfer_id), safe="")
+        try:
+            api_request("DELETE", f"/transfers/downloads/{username}/{encoded_id}", params={"remove": "true"})
+        except requests.HTTPError as exc:
+            if exc.response is None or exc.response.status_code != 404:
+                update_track(track["id"], status="download_error", download_state="Recovery failed",
+                             result=f"Автовосстановление не удалось · не отменена старая передача: {exc}", error=str(exc)[:400])
+                return False
+        except Exception as exc:
+            update_track(track["id"], status="download_error", download_state="Recovery failed",
+                         result=f"Автовосстановление не удалось · не отменена старая передача: {exc}", error=str(exc)[:400])
+            return False
+
+    cfg = settings()
+    retries = int(track["download_retry_count"] or 0)
+    if retries >= cfg["download_max_retries"]:
+        update_track(track["id"], status="download_error", download_state="Recovery limit reached",
+                     result=f"Скачивание остановлено после {retries} повторов · {reason}", error=reason)
+        return False
+
+    try:
+        attempted = json.loads(track["download_attempted_sources"] or "[]")
+    except (TypeError, ValueError):
+        attempted = []
+    source = [track["username"] or "", str(track["filename"] or "").replace("\\", "/")]
+    if not any(str(old[0]).casefold() == source[0].casefold()
+               and str(old[1]).replace("\\", "/").casefold() == source[1].casefold()
+               for old in attempted if isinstance(old, (list, tuple)) and len(old) == 2):
+        attempted.append(source)
+    next_pass = 2 if retries == 0 else 3
+    next_status = "retry_queued" if next_pass == 2 else "sequential_queued"
+    update_track(track["id"], status=next_status, **{"pass": next_pass},
+                 download_id=None, download_requested_at=None, download_state=None,
+                 download_state_since=None,
+                 download_attempted_sources=json.dumps(attempted, ensure_ascii=False),
+                 download_retry_count=retries + 1,
+                 result=f"Загрузка зависла или завершилась ошибкой · повторный поиск другого источника ({retries + 1}/{cfg['download_max_retries']}) · {reason}",
+                 error=None)
+    queue_event.set()
+    return True
+
+
 def transfer_monitor():
     while True:
         try:
             with connect() as db:
                 pending = db.execute("SELECT * FROM tracks WHERE status IN ('download_queued','downloading')").fetchall()
             if pending:
+                cfg = settings()
                 transfers = flatten_transfer_files(api_request("GET", "/transfers/downloads", params={"includeRemoved": "true"}))
                 for track in pending:
                     matches = [item for item in transfers
@@ -758,6 +829,10 @@ def transfer_monitor():
                     transfer = matches[-1]
                     state = str(transfer.get("state", "Unknown"))
                     normalized = state.casefold()
+                    now = time.time()
+                    state_since = track["download_state_since"] if track["download_state"] == state else now
+                    if state_since is None:
+                        state_since = now
                     if "completed" in normalized and "succeeded" in normalized:
                         status = "downloaded"
                     elif any(term in normalized for term in ("failed", "errored", "cancelled", "timedout", "rejected", "aborted")):
@@ -770,15 +845,25 @@ def transfer_monitor():
                     progress = f" · {percent:.0f}%" if isinstance(percent, (int, float)) else ""
                     update_track(track["id"], status=status, download_id=transfer.get("id"),
                                  download_state=state,
+                                 download_state_since=state_since,
                                  result=f"{state}{progress} · {track['filename']}",
                                  error=None if status != "download_error" else state)
+                    if status == "download_error":
+                        recover_download(track, transfer, state, cancel=False)
+                        continue
+                    if normalized.startswith("queued, remotely"):
+                        download_started = track["download_requested_at"] or state_since
+                        if now - download_started >= cfg["download_stall_seconds"]:
+                            recover_download(track, transfer,
+                                             f"удалённая очередь не начала передачу за {cfg['download_stall_seconds']} сек")
+                            continue
                     if status == "downloaded":
                         move_completed_file(track, transfer)
                         if track["recommendation_id"]:
                             sync_navidrome_playlist()
         except Exception as exc:
             app.logger.warning("Download status polling failed: %s", exc)
-        time.sleep(4)
+        time.sleep(1)
 
 
 def recommendation_playlist_monitor():
@@ -877,7 +962,11 @@ def process_track(track_id):
                           for candidate in peer.get("files", [])
                           if isinstance(candidate, dict)
                           and os.path.splitext(candidate.get("filename", ""))[1].lower() in AUDIO_EXTS)
-        best = choose_file(responses, track["title"])
+        try:
+            excluded_sources = json.loads(track["download_attempted_sources"] or "[]")
+        except (TypeError, ValueError):
+            excluded_sources = []
+        best = choose_file(responses, track["title"], excluded_sources)
         search_summary = f"{response_count} пользователей · {audio_count}/{file_count} аудиофайлов · {search_state}"
         if not best or best[2] < threshold / 100:
             best_summary = "аудиофайлов с подходящим названием нет"
@@ -1123,6 +1212,8 @@ def put_settings():
             "concurrency": max(1, min(32, int(body.get("concurrency", 3)))),
             "match_threshold": max(10, min(90, int(body.get("match_threshold", 25)))),
             "retry_match_threshold": max(10, min(90, int(body.get("retry_match_threshold", 15)))),
+            "download_stall_seconds": max(1, min(3600, int(body.get("download_stall_seconds", 5)))),
+            "download_max_retries": max(1, min(5, int(body.get("download_max_retries", 5)))),
             "retry_enabled": str(bool(body.get("retry_enabled"))).lower(),
             "burst_searches": str(bool(body.get("burst_searches"))).lower(),
         }
