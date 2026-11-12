@@ -212,7 +212,10 @@ def lastfm_recommendations(body):
             seeds = lastfm_items(lastfm_call("user.getRecentTracks", {"user": user, "limit": 100}), "recenttracks", "track")
             seeds = [seed for seed in seeds
                      if seed.get("name") and lastfm_artist_name(seed.get("artist", {}))]
-            seeds = [random.choice(seeds)] if seeds else []
+            # Build a broader candidate pool from several randomly selected recent
+            # listening seeds, as the earlier implementation did. A single seed
+            # made repeated playlists cluster around one track/artist.
+            seeds = random.sample(seeds, min(8, len(seeds)))
         else:
             seeds = lastfm_items(lastfm_call("user.getLovedTracks", {"user": user, "limit": 8}), "lovedtracks", "track")
         for seed in seeds[:8]:
@@ -298,6 +301,41 @@ def store_recent_recommendations(items):
         else:
             db.execute("DELETE FROM recommendation_items WHERE playlist_id=?", (RECENT_PLAYLIST_ID,))
     sync_navidrome_playlist()
+
+
+def queue_recommendations(items, start=True, download=True):
+    """Add recommendation items to the normal track queue and link playlist rows."""
+    valid = [(item, f"{item.get('artist', '').strip()} - {item.get('title', '').strip()}".strip(" -"))
+             for item in items if item.get("artist", "").strip() and item.get("title", "").strip()]
+    if not valid:
+        return {"added": 0, "skipped": 0, "resumed": False, "staged": not start}
+    now = time.time()
+    batch_id = str(uuid.uuid4())
+    status = "queued" if start else "staged"
+    resumed = pause_event.is_set() and start
+    added = skipped = 0
+    with lock:
+        if start:
+            pause_event.clear()
+        with connect() as db:
+            for item, line in valid:
+                recommendation_id = item.get("id")
+                if recommendation_id:
+                    existing = db.execute("SELECT track_id FROM recommendation_items WHERE id=?", (recommendation_id,)).fetchone()
+                    if existing and existing["track_id"]:
+                        skipped += 1
+                        continue
+                track_id = str(uuid.uuid4())
+                db.execute("INSERT INTO tracks(id,title,query,status,created,updated,batch_id,download_enabled,recommendation_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                           (track_id, line, line, status, now, now, batch_id, int(download), recommendation_id))
+                if recommendation_id:
+                    db.execute("UPDATE recommendation_items SET track_id=? WHERE id=?", (track_id, recommendation_id))
+                added += 1
+    if start and added:
+        queue_event.set()
+    if any(item.get("id") for item, _ in valid):
+        sync_navidrome_playlist()
+    return {"added": added, "skipped": skipped, "resumed": resumed, "staged": not start}
 
 
 def _write_navidrome_playlist():
@@ -1182,7 +1220,14 @@ def get_lastfm_recommendations():
             playlist_id = RECENT_PLAYLIST_ID
             for item in items:
                 item["id"] = recommendation_item_id(item, RECENT_PLAYLIST_ID)
-        return jsonify(items=items, playlist_id=playlist_id)
+        result = {"items": items, "playlist_id": playlist_id}
+        if body.get("queue"):
+            result["queue"] = queue_recommendations(
+                items,
+                start=bool(body.get("start", True)),
+                download=bool(body.get("download", True)),
+            )
+        return jsonify(result)
     except Exception as exc:
         return jsonify(error=str(exc)), 400
 
