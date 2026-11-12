@@ -1,6 +1,7 @@
 import contextlib
 import filecmp
 import hashlib
+import io
 import json
 import os
 import pathlib
@@ -16,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 
 import requests
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
 
 app = Flask(__name__)
 DB_PATH = os.environ.get("DB_PATH", "/data/tracks.db")
@@ -42,6 +43,7 @@ lock = threading.Lock()
 search_post_lock = threading.Lock()
 download_post_lock = threading.Lock()
 playlist_sync_lock = threading.Lock()
+playlist_seed_lock = threading.Lock()
 file_move_lock = threading.Lock()
 pause_event = threading.Event()
 queue_event = threading.Event()
@@ -88,7 +90,8 @@ def init_db():
             move_attempts INTEGER NOT NULL DEFAULT 0,
             download_state_since REAL,
             download_attempted_sources TEXT NOT NULL DEFAULT '[]',
-            download_retry_count INTEGER NOT NULL DEFAULT 0)""")
+            download_retry_count INTEGER NOT NULL DEFAULT 0,
+            playlist_id TEXT)""")
         db.execute("""CREATE TABLE IF NOT EXISTS recommendation_playlists (
             id TEXT PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL,
             updated REAL NOT NULL)""")
@@ -96,6 +99,13 @@ def init_db():
             id TEXT PRIMARY KEY, playlist_id TEXT NOT NULL, artist TEXT NOT NULL,
             title TEXT NOT NULL, match REAL, source TEXT, url TEXT, position INTEGER NOT NULL,
             track_id TEXT, local_path TEXT, created REAL NOT NULL,
+            FOREIGN KEY(playlist_id) REFERENCES recommendation_playlists(id),
+            FOREIGN KEY(track_id) REFERENCES tracks(id))""")
+        db.execute("""CREATE TABLE IF NOT EXISTS playlist_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            playlist_id TEXT NOT NULL, position INTEGER NOT NULL,
+            path TEXT NOT NULL, title TEXT NOT NULL, track_id TEXT,
+            created REAL NOT NULL, UNIQUE(playlist_id,path),
             FOREIGN KEY(playlist_id) REFERENCES recommendation_playlists(id),
             FOREIGN KEY(track_id) REFERENCES tracks(id))""")
         existing = {row["name"] for row in db.execute("PRAGMA table_info(tracks)")}
@@ -129,6 +139,10 @@ def init_db():
             db.execute("ALTER TABLE tracks ADD COLUMN download_attempted_sources TEXT NOT NULL DEFAULT '[]'")
         if "download_retry_count" not in existing:
             db.execute("ALTER TABLE tracks ADD COLUMN download_retry_count INTEGER NOT NULL DEFAULT 0")
+        if "playlist_id" not in existing:
+            db.execute("ALTER TABLE tracks ADD COLUMN playlist_id TEXT")
+        db.execute("""UPDATE tracks SET playlist_id=(SELECT playlist_id FROM recommendation_items ri
+            WHERE ri.id=tracks.recommendation_id) WHERE playlist_id IS NULL AND recommendation_id IS NOT NULL""")
         for key, value in DEFAULTS.items():
             db.execute("INSERT OR IGNORE INTO settings(key,value) VALUES (?,?)", (key, str(value)))
         db.execute("UPDATE settings SET value='5' WHERE key='download_max_retries' AND value='3'")
@@ -291,15 +305,50 @@ def recommendation_item_id(item, playlist_id=RECENT_PLAYLIST_ID):
     return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
 
 
-def store_recent_recommendations(items):
+def recommendation_playlist_name(body):
+    custom = str(body.get("name", "")).strip()
+    if custom:
+        return custom[:120]
+    mode = str(body.get("mode", "top_tracks"))
+    period_names = {"overall": "за всё время", "12month": "за 12 месяцев", "6month": "за 6 месяцев",
+                    "3month": "за 3 месяца", "1month": "за месяц", "7day": "за неделю"}
+    period = period_names.get(str(body.get("period", "overall")), str(body.get("period", "overall")))
+    query = str(body.get("query", "")).strip()
+    artist = str(body.get("artist", "")).strip()
+    names = {
+        "recent_tracks": RECENT_PLAYLIST_NAME,
+        "top_tracks": f"Похожие на топ-треки {period}",
+        "loved_tracks": "Похожие на любимые треки",
+        "top_artists": f"Треки похожих исполнителей {period}",
+        "genre_tracks": f"Треки по тегу {query}",
+        "genre_artists": f"Исполнители по тегу {query}",
+        "similar_artist": f"Похожие на исполнителя {query}",
+        "similar_track": f"Похожие на {artist} — {query}",
+    }
+    return names.get(mode, "Рекомендации Last.fm")[:120]
+
+
+def unique_playlist_name(name, playlist_id=None):
+    with connect() as db:
+        rows = db.execute("SELECT id,name FROM recommendation_playlists").fetchall()
+    existing = {safe_playlist_folder(row["name"]).casefold() for row in rows if row["id"] != playlist_id}
+    if safe_playlist_folder(name).casefold() not in existing:
+        return name
+    index = 2
+    while safe_playlist_folder(f"{name} ({index})").casefold() in existing:
+        index += 1
+    return f"{name} ({index})"[:120]
+
+
+def store_recommendation_playlist(items, playlist_id, name, category):
     now = time.time()
     with connect() as db:
         db.execute("INSERT INTO recommendation_playlists(id,name,category,updated) VALUES(?,?,?,?) "
                    "ON CONFLICT(id) DO UPDATE SET name=excluded.name,updated=excluded.updated",
-                   (RECENT_PLAYLIST_ID, RECENT_PLAYLIST_NAME, RECENT_PLAYLIST_ID, now))
+                   (playlist_id, name, category, now))
         ids = []
         for position, item in enumerate(items):
-            item_id = recommendation_item_id(item, RECENT_PLAYLIST_ID)
+            item_id = recommendation_item_id(item, playlist_id)
             ids.append(item_id)
             db.execute("""INSERT INTO recommendation_items
                 (id,playlist_id,artist,title,match,source,url,position,created)
@@ -307,21 +356,31 @@ def store_recent_recommendations(items):
                 playlist_id=excluded.playlist_id,artist=excluded.artist,title=excluded.title,
                 match=excluded.match,source=excluded.source,url=excluded.url,
                 position=excluded.position,created=excluded.created""",
-                       (item_id, RECENT_PLAYLIST_ID, item.get("artist", ""), item.get("title", ""),
+                       (item_id, playlist_id, item.get("artist", ""), item.get("title", ""),
                         item.get("match"), item.get("source", ""), item.get("url", ""), position, now))
         if ids:
             placeholders = ",".join("?" for _ in ids)
             db.execute(f"DELETE FROM recommendation_items WHERE playlist_id=? AND id NOT IN ({placeholders})",
-                       [RECENT_PLAYLIST_ID, *ids])
+                       [playlist_id, *ids])
         else:
-            db.execute("DELETE FROM recommendation_items WHERE playlist_id=?", (RECENT_PLAYLIST_ID,))
+            db.execute("DELETE FROM recommendation_items WHERE playlist_id=?", (playlist_id,))
+    return [dict(item, id=recommendation_item_id(item, playlist_id)) for item in items]
+
+
+def store_recent_recommendations(items):
+    stored = store_recommendation_playlist(items, RECENT_PLAYLIST_ID, RECENT_PLAYLIST_NAME, RECENT_PLAYLIST_ID)
     sync_navidrome_playlist()
+    return stored
 
 
 def queue_recommendations(items, start=True, download=True):
     """Add recommendation items to the normal track queue and link playlist rows."""
-    valid = [(item, f"{item.get('artist', '').strip()} - {item.get('title', '').strip()}".strip(" -"))
-             for item in items if item.get("artist", "").strip() and item.get("title", "").strip()]
+    valid = []
+    for item in items:
+        artist = str(item.get("artist", "")).strip()
+        title = str(item.get("title", "")).strip()
+        if artist:
+            valid.append((item, f"{artist} - {title}" if title else artist))
     if not valid:
         return {"added": 0, "skipped": 0, "resumed": False, "staged": not start}
     now = time.time()
@@ -335,14 +394,17 @@ def queue_recommendations(items, start=True, download=True):
         with connect() as db:
             for item, line in valid:
                 recommendation_id = item.get("id")
+                playlist_id = None
                 if recommendation_id:
-                    existing = db.execute("SELECT track_id FROM recommendation_items WHERE id=?", (recommendation_id,)).fetchone()
+                    existing = db.execute("SELECT track_id,playlist_id FROM recommendation_items WHERE id=?", (recommendation_id,)).fetchone()
                     if existing and existing["track_id"]:
                         skipped += 1
                         continue
+                    if existing:
+                        playlist_id = existing["playlist_id"]
                 track_id = str(uuid.uuid4())
-                db.execute("INSERT INTO tracks(id,title,query,status,created,updated,batch_id,download_enabled,recommendation_id) VALUES(?,?,?,?,?,?,?,?,?)",
-                           (track_id, line, line, status, now, now, batch_id, int(download), recommendation_id))
+                db.execute("INSERT INTO tracks(id,title,query,status,created,updated,batch_id,download_enabled,recommendation_id,playlist_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                           (track_id, line, line, status, now, now, batch_id, int(download), recommendation_id, playlist_id))
                 if recommendation_id:
                     db.execute("UPDATE recommendation_items SET track_id=? WHERE id=?", (track_id, recommendation_id))
                 added += 1
@@ -353,78 +415,110 @@ def queue_recommendations(items, start=True, download=True):
     return {"added": added, "skipped": skipped, "resumed": resumed, "staged": not start}
 
 
+def _playlist_entries(playlist_id):
+    """Return existing playlist files in their persistent append order."""
+    _seed_playlist_entries(playlist_id)
+    root = pathlib.Path(DOWNLOAD_DESTINATION_PATH or NAVIDROME_MUSIC_PATH or ".").resolve()
+    with connect() as db:
+        rows = db.execute("SELECT * FROM playlist_entries WHERE playlist_id=? ORDER BY position,id", (playlist_id,)).fetchall()
+    entries = []
+    for row in rows:
+        candidate = (root / pathlib.PurePosixPath(row["path"])).resolve()
+        if candidate.is_relative_to(root) and candidate.is_file():
+            item = dict(row)
+            item["available"] = True
+            entries.append(item)
+    return entries
+
+
+def safe_playlist_folder(name):
+    cleaned = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", str(name or "")).strip(" .")
+    return (cleaned[:120] or "Плейлист")
+
+
+def _seed_playlist_entries(playlist_id):
+    with playlist_seed_lock:
+        _seed_playlist_entries_locked(playlist_id)
+
+
+def _seed_playlist_entries_locked(playlist_id):
+    """Import the existing M3U once, then append any legacy files deterministically."""
+    root = pathlib.Path(DOWNLOAD_DESTINATION_PATH or NAVIDROME_MUSIC_PATH or ".").resolve()
+    with connect() as db:
+        playlist = db.execute("SELECT name FROM recommendation_playlists WHERE id=?", (playlist_id,)).fetchone()
+        if not playlist or db.execute("SELECT 1 FROM playlist_entries WHERE playlist_id=? LIMIT 1", (playlist_id,)).fetchone():
+            return
+        folder_name = safe_playlist_folder(playlist["name"])
+    playlist_dir = pathlib.Path(NAVIDROME_PLAYLIST_PATH) if NAVIDROME_PLAYLIST_PATH else root
+    output = playlist_dir / f"{folder_name}.m3u"
+    with connect() as db:
+        if db.execute("SELECT 1 FROM playlist_entries WHERE playlist_id=? LIMIT 1", (playlist_id,)).fetchone():
+            return
+        ordered = []
+        if output.is_file():
+            try:
+                prior_lines = output.read_text(encoding="utf-8-sig").splitlines()
+                for index, line in enumerate(prior_lines):
+                    value = line.strip()
+                    if not value or value.startswith("#"):
+                        continue
+                    candidate = (root / pathlib.PurePosixPath(value)).resolve()
+                    if candidate.is_relative_to(root) and candidate.is_file() and candidate.suffix.lower() in AUDIO_EXTS:
+                        title = candidate.stem
+                        for preceding in reversed(prior_lines[:index]):
+                            if preceding.startswith("#EXTINF:"):
+                                title = preceding.partition(",")[2].strip() or title
+                                break
+                        ordered.append((value.replace("\\", "/"), title, None))
+            except (OSError, UnicodeError):
+                ordered = []
+        # Include older files that were not present in the previous M3U, in a stable order.
+        folder = (root / folder_name).resolve()
+        if folder.is_relative_to(root) and folder.is_dir():
+            known = {path.casefold() for path, _, _ in ordered}
+            extra = []
+            for current, dirs, names in os.walk(folder):
+                dirs.sort(key=str.casefold)
+                for name in sorted(names, key=str.casefold):
+                    candidate = (pathlib.Path(current) / name).resolve()
+                    if candidate.suffix.lower() not in AUDIO_EXTS or not candidate.is_file() or not candidate.is_relative_to(root):
+                        continue
+                    relative = candidate.relative_to(root).as_posix()
+                    if relative.casefold() not in known:
+                        extra.append((relative, candidate.stem, None))
+            ordered.extend(extra)
+        for position, (path, title, track_id) in enumerate(ordered, start=1):
+            db.execute("INSERT OR IGNORE INTO playlist_entries(playlist_id,position,path,title,track_id,created) VALUES(?,?,?,?,?,?)",
+                       (playlist_id, position, path, title, track_id, time.time()))
+
+
+def _playlist_m3u_content(playlist_id):
+    entries = _playlist_entries(playlist_id)
+    lines = ["#EXTM3U"]
+    for entry in entries:
+        label = str(entry.get("title") or pathlib.PurePosixPath(entry["path"]).stem).replace("\r", " ").replace("\n", " ")
+        lines.extend((f"#EXTINF:-1,{label}", str(entry["path"]).replace("\\", "/")))
+    return "\n".join(lines) + "\n"
+
+
 def _write_navidrome_playlist():
-    """Write the Navidrome-owned M3U source from recommendation rows with local media."""
-    if not NAVIDROME_MUSIC_PATH or not NAVIDROME_PLAYLIST_PATH:
+    """Write every recommendation M3U using the durable append order."""
+    if not NAVIDROME_PLAYLIST_PATH:
         return False
     playlist_dir = pathlib.Path(NAVIDROME_PLAYLIST_PATH)
     playlist_dir.mkdir(parents=True, exist_ok=True)
-    output = playlist_dir / f"{RECENT_PLAYLIST_NAME}.m3u"
-    root = pathlib.Path(NAVIDROME_MUSIC_PATH).resolve()
-    destination_root = pathlib.Path(DOWNLOAD_DESTINATION_PATH).resolve() if DOWNLOAD_DESTINATION_PATH else root
-    recommendation_dir = (destination_root / RECENT_PLAYLIST_NAME).resolve()
-    recommendation_files = []
-    if recommendation_dir.is_relative_to(destination_root) and recommendation_dir.is_dir():
-        for folder, _, names in os.walk(recommendation_dir):
-            for name in names:
-                if pathlib.Path(name).suffix.lower() not in AUDIO_EXTS:
-                    continue
-                candidate = (pathlib.Path(folder) / name).resolve()
-                if candidate.is_relative_to(destination_root) and candidate.is_file():
-                    recommendation_files.append(candidate)
-    media_by_stem = {}
-    for folder, _, names in os.walk(root):
-        for name in names:
-            path = pathlib.Path(folder) / name
-            if path.suffix.lower() in AUDIO_EXTS:
-                media_by_stem.setdefault(normalize(path.stem), []).append(path)
     with connect() as db:
-        rows = db.execute("""SELECT ri.id,ri.artist,ri.title,ri.position,ri.local_path,
-            t.filename,t.status,t.local_path AS track_local_path FROM recommendation_items ri
-            LEFT JOIN tracks t ON t.id=ri.track_id
-            WHERE ri.playlist_id=? ORDER BY ri.position""", (RECENT_PLAYLIST_ID,)).fetchall()
-        lines = ["#EXTM3U"]
-        included_paths = set()
-        for path in recommendation_files:
-            relative = path.resolve().relative_to(destination_root).as_posix()
-            included_paths.add(relative.casefold())
-            lines.extend((f"#EXTINF:-1,{path.stem}", relative))
-        for row in rows:
-            relative = None
-            # Prefer the queue path: the recommendation row may still have an old location.
-            for stored_path in (row["track_local_path"], row["local_path"]):
-                if not stored_path:
-                    continue
-                for media_root in (destination_root, root):
-                    candidate = (media_root / pathlib.PurePosixPath(stored_path)).resolve()
-                    if candidate.is_relative_to(media_root) and candidate.is_file():
-                        relative = candidate.relative_to(media_root).as_posix()
-                        break
-                if relative:
-                    break
-            if not relative:
-                remote_base = normalize(os.path.splitext(os.path.basename(str(row["filename"] or "").replace("\\", "/")))[0])
-                artist_title = normalize(f"{row['artist']} {row['title']}")
-                title = normalize(row["title"])
-                candidates = media_by_stem.get(remote_base, []) if remote_base else []
-                if not candidates:
-                    candidates = media_by_stem.get(artist_title, []) or media_by_stem.get(title, [])
-                if len(candidates) == 1:
-                    relative = candidates[0].relative_to(root).as_posix()
-            if relative and row["local_path"] != relative:
-                db.execute("UPDATE recommendation_items SET local_path=? WHERE id=?", (relative, row["id"]))
-            if relative and relative.casefold() not in included_paths:
-                included_paths.add(relative.casefold())
-                label = " - ".join(part for part in (row["artist"], row["title"]) if part)
-                lines.extend((f"#EXTINF:-1,{label}", relative.replace("\\", "/")))
-    content = "\n".join(lines) + "\n"
-    temporary = output.with_suffix(output.suffix + ".tmp")
-    temporary.write_text(content, encoding="utf-8-sig", newline="\n")
-    os.replace(temporary, output)
+        playlists = db.execute("SELECT id,name FROM recommendation_playlists").fetchall()
+    for playlist in playlists:
+        output = playlist_dir / f"{safe_playlist_folder(playlist['name'])}.m3u"
+        content = _playlist_m3u_content(playlist["id"])
+        temporary = output.with_suffix(output.suffix + ".tmp")
+        temporary.write_text(content, encoding="utf-8-sig", newline="\n")
+        os.replace(temporary, output)
+        app.logger.info("Updated Navidrome playlist %s with %d tracks", playlist["id"], max(0, content.count("#EXTINF:")))
     legacy_output = playlist_dir / "Last.fm - Recent recommendations.m3u"
-    if legacy_output != output:
+    if legacy_output.exists() and RECENT_PLAYLIST_NAME != legacy_output.stem:
         legacy_output.unlink(missing_ok=True)
-    app.logger.info("Updated Navidrome playlist with %d tracks", len(included_paths))
     return True
 
 
@@ -436,28 +530,45 @@ def sync_navidrome_playlist():
 
 
 def append_navidrome_playlist_entry(track, local_path):
-    if not NAVIDROME_PLAYLIST_PATH or not track["recommendation_id"]:
+    if not track["recommendation_id"]:
         return False
     path = pathlib.PurePosixPath(local_path)
-    if not path.parts or path.parts[0] != RECENT_PLAYLIST_NAME:
-        return False
     normalized_path = path.as_posix()
     try:
-        playlist_dir = pathlib.Path(NAVIDROME_PLAYLIST_PATH)
-        playlist_dir.mkdir(parents=True, exist_ok=True)
-        output = playlist_dir / f"{RECENT_PLAYLIST_NAME}.m3u"
         with playlist_sync_lock:
-            lines = output.read_text(encoding="utf-8-sig").splitlines() if output.is_file() else []
-            if not lines or lines[0].strip() != "#EXTM3U":
-                lines.insert(0, "#EXTM3U")
-            existing = {line.strip().casefold() for line in lines if line.strip() and not line.lstrip().startswith("#")}
-            if normalized_path.casefold() in existing:
+            playlist_id = track["playlist_id"]
+            if not playlist_id:
+                with connect() as db:
+                    row = db.execute("SELECT playlist_id FROM recommendation_items WHERE id=?", (track["recommendation_id"],)).fetchone()
+                playlist_id = row["playlist_id"] if row else RECENT_PLAYLIST_ID
+            with connect() as db:
+                playlist = db.execute("SELECT name FROM recommendation_playlists WHERE id=?", (playlist_id,)).fetchone()
+            if not playlist:
                 return False
-            label = track["title"].replace("\r", " ").replace("\n", " ")
-            lines.extend((f"#EXTINF:-1,{label}", normalized_path))
-            temporary = output.with_suffix(output.suffix + ".tmp")
-            temporary.write_text("\n".join(lines) + "\n", encoding="utf-8-sig", newline="\n")
-            os.replace(temporary, output)
+            folder_name = safe_playlist_folder(playlist["name"])
+            if not path.parts or path.parts[0] != folder_name:
+                return False
+            _seed_playlist_entries(playlist_id)
+            root = pathlib.Path(DOWNLOAD_DESTINATION_PATH or NAVIDROME_MUSIC_PATH or ".").resolve()
+            candidate = (root / path).resolve()
+            if not candidate.is_relative_to(root) or not candidate.is_file():
+                return False
+            with connect() as db:
+                exists = db.execute("SELECT 1 FROM playlist_entries WHERE playlist_id=? AND path=?", (playlist_id, normalized_path)).fetchone()
+                if not exists:
+                    position = db.execute("SELECT COALESCE(MAX(position),0)+1 FROM playlist_entries WHERE playlist_id=?", (playlist_id,)).fetchone()[0]
+                    db.execute("INSERT INTO playlist_entries(playlist_id,position,path,title,track_id,created) VALUES(?,?,?,?,?,?)",
+                               (playlist_id, position, normalized_path, track["title"], track["id"], time.time()))
+                else:
+                    db.execute("UPDATE playlist_entries SET title=?,track_id=COALESCE(track_id,?) WHERE playlist_id=? AND path=?",
+                               (track["title"], track["id"], playlist_id, normalized_path))
+            if NAVIDROME_PLAYLIST_PATH:
+                playlist_dir = pathlib.Path(NAVIDROME_PLAYLIST_PATH)
+                playlist_dir.mkdir(parents=True, exist_ok=True)
+                output = playlist_dir / f"{folder_name}.m3u"
+                temporary = output.with_suffix(output.suffix + ".tmp")
+                temporary.write_text(_playlist_m3u_content(playlist_id), encoding="utf-8-sig", newline="\n")
+                os.replace(temporary, output)
     except OSError as exc:
         app.logger.warning("Could not add file to Navidrome playlist: %s", exc)
         return False
@@ -676,6 +787,11 @@ def _move_completed_file_locked(track, transfer=None):
         return None
     destination_root = pathlib.Path(DOWNLOAD_DESTINATION_PATH).resolve()
     folder_name = RECENT_PLAYLIST_NAME if track["recommendation_id"] else "Загрузки"
+    if track["playlist_id"]:
+        with connect() as db:
+            playlist = db.execute("SELECT name FROM recommendation_playlists WHERE id=?", (track["playlist_id"],)).fetchone()
+        if playlist:
+            folder_name = safe_playlist_folder(playlist["name"])
     relative = pathlib.PurePosixPath(folder_name, remote_parts[-1])
     destination = (destination_root / pathlib.Path(*relative.parts)).resolve()
     if not destination.is_relative_to(destination_root):
@@ -1094,14 +1210,17 @@ def add_tracks():
             for index, line in enumerate(lines):
                 # Each line may be `Artist - Track`; arbitrary query text is also accepted.
                 recommendation_id = recommendation_ids[index] if index < len(recommendation_ids) else None
+                playlist_id = None
                 if recommendation_id:
-                    existing_rec = db.execute("SELECT track_id FROM recommendation_items WHERE id=?", (recommendation_id,)).fetchone()
+                    existing_rec = db.execute("SELECT track_id,playlist_id FROM recommendation_items WHERE id=?", (recommendation_id,)).fetchone()
                     if existing_rec and existing_rec["track_id"]:
                         skipped += 1
                         continue
+                    if existing_rec:
+                        playlist_id = existing_rec["playlist_id"]
                 track_id = str(uuid.uuid4())
-                db.execute("INSERT INTO tracks(id,title,query,status,created,updated,batch_id,download_enabled,recommendation_id) VALUES(?,?,?,?,?,?,?,?,?)",
-                           (track_id, line, line, status, now, now, batch_id, download_enabled, recommendation_id))
+                db.execute("INSERT INTO tracks(id,title,query,status,created,updated,batch_id,download_enabled,recommendation_id,playlist_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                           (track_id, line, line, status, now, now, batch_id, download_enabled, recommendation_id, playlist_id))
                 if recommendation_id:
                     db.execute("UPDATE recommendation_items SET track_id=? WHERE id=?",
                                (track_id, recommendation_id))
@@ -1323,29 +1442,113 @@ def get_lastfm_recommendations():
         return jsonify(error=str(exc)), 400
 
 
-@app.get("/api/lastfm/playlists/recent-tracks")
-def get_recent_recommendation_playlist():
+def recommendation_playlist_payload(playlist_id):
     with connect() as db:
-        playlist = db.execute("SELECT * FROM recommendation_playlists WHERE id=?", (RECENT_PLAYLIST_ID,)).fetchone()
+        playlist = db.execute("SELECT * FROM recommendation_playlists WHERE id=?", (playlist_id,)).fetchone()
         if not playlist:
-            return jsonify(id=RECENT_PLAYLIST_ID, name="Похожие на недавние прослушивания", items=[], updated_at=None)
+            return None
         rows = db.execute("""SELECT ri.*,t.status AS download_status,t.download_state,
-            t.result AS download_result FROM recommendation_items ri
-            LEFT JOIN tracks t ON t.id=ri.track_id WHERE ri.playlist_id=? ORDER BY ri.position""",
-                          (RECENT_PLAYLIST_ID,)).fetchall()
-    items = []
-    music_root = pathlib.Path(NAVIDROME_MUSIC_PATH).resolve() if NAVIDROME_MUSIC_PATH else None
+            t.result AS download_result,t.local_path AS track_local_path
+            FROM recommendation_items ri LEFT JOIN tracks t ON t.id=ri.track_id
+            WHERE ri.playlist_id=? ORDER BY ri.position""", (playlist_id,)).fetchall()
+    roots = [pathlib.Path(value).resolve() for value in (DOWNLOAD_DESTINATION_PATH, NAVIDROME_MUSIC_PATH) if value]
+    recommendations = []
     for row in rows:
         item = dict(row)
-        available = False
-        if item.get("local_path") and music_root:
-            candidate = (music_root / pathlib.PurePosixPath(item["local_path"])).resolve()
-            available = candidate.is_relative_to(music_root) and candidate.is_file()
-        item["available"] = available
+        item["downloaded_path"] = None
+        for stored_path in (item.get("track_local_path"), item.get("local_path")):
+            if not stored_path:
+                continue
+            for root in roots:
+                candidate = (root / pathlib.PurePosixPath(stored_path)).resolve()
+                if candidate.is_relative_to(root) and candidate.is_file():
+                    item["downloaded_path"] = candidate.relative_to(root).as_posix()
+                    break
+            if item["downloaded_path"]:
+                break
+        item["available"] = bool(item["downloaded_path"])
         item["state"] = "available" if item["available"] else item.get("download_status") or "recommended"
-        items.append(item)
-    return jsonify(id=playlist["id"], name=playlist["name"], category=playlist["category"],
-                   updated_at=playlist["updated"], items=items)
+        recommendations.append(item)
+    downloaded = _playlist_entries(playlist_id)
+    return {
+        "id": playlist["id"], "name": playlist["name"], "category": playlist["category"],
+        "updated_at": playlist["updated"], "items": recommendations,
+        "downloaded_items": downloaded,
+    }
+
+
+@app.get("/api/playlists")
+@app.get("/api/lastfm/playlists")
+def list_playlists():
+    with connect() as db:
+        playlists = db.execute("SELECT * FROM recommendation_playlists ORDER BY name COLLATE NOCASE").fetchall()
+    result = []
+    for playlist in playlists:
+        item = dict(playlist)
+        item["recommendation_count"] = 0
+        with connect() as db:
+            item["recommendation_count"] = db.execute("SELECT COUNT(*) FROM recommendation_items WHERE playlist_id=?", (playlist["id"],)).fetchone()[0]
+        item["downloaded_count"] = len(_playlist_entries(playlist["id"]))
+        result.append(item)
+    return jsonify(playlists=result)
+
+
+@app.post("/api/playlists")
+@app.post("/api/lastfm/playlists")
+def create_playlist():
+    try:
+        body = request.get_json(silent=True) or {}
+        mode = str(body.get("mode", "top_tracks"))
+        items = lastfm_recommendations(body)
+        requested_id = str(body.get("playlist_id", "")).strip()
+        if requested_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", requested_id):
+            raise ValueError("playlist_id должен содержать только латинские буквы, цифры, _ или - (до 80 символов).")
+        playlist_id = requested_id or (RECENT_PLAYLIST_ID if mode == RECENT_PLAYLIST_ID else str(uuid.uuid4()))
+        name = recommendation_playlist_name(body)
+        if playlist_id != RECENT_PLAYLIST_ID:
+            name = unique_playlist_name(name, playlist_id)
+        items = store_recommendation_playlist(items, playlist_id, name, mode)
+        result = {"playlist_id": playlist_id, "name": name, "category": mode, "items": items}
+        if body.get("queue"):
+            result["queue"] = queue_recommendations(
+                items,
+                start=bool(body.get("start", True)),
+                download=bool(body.get("download", True)),
+            )
+        else:
+            sync_navidrome_playlist()
+        return jsonify(result), 201
+    except Exception as exc:
+        return jsonify(error=str(exc)), 400
+
+
+@app.get("/api/playlists/<playlist_id>")
+@app.get("/api/lastfm/playlists/<playlist_id>")
+def get_playlist(playlist_id):
+    playlist = recommendation_playlist_payload(playlist_id)
+    if playlist is None:
+        return jsonify(error="Плейлист не найден."), 404
+    return jsonify(playlist)
+
+
+@app.get("/api/playlists/<playlist_id>/download")
+@app.get("/api/lastfm/playlists/<playlist_id>/download")
+def download_playlist(playlist_id):
+    with connect() as db:
+        playlist = db.execute("SELECT name FROM recommendation_playlists WHERE id=?", (playlist_id,)).fetchone()
+    if not playlist:
+        return jsonify(error="Плейлист не найден."), 404
+    data = io.BytesIO(_playlist_m3u_content(playlist_id).encode("utf-8-sig"))
+    return send_file(data, mimetype="audio/x-mpegurl", as_attachment=True,
+                     download_name=f"{playlist['name']}.m3u")
+
+
+@app.get("/api/lastfm/playlists/recent-tracks")
+def get_recent_recommendation_playlist():
+    playlist = recommendation_playlist_payload(RECENT_PLAYLIST_ID)
+    if playlist is None:
+        return jsonify(id=RECENT_PLAYLIST_ID, name=RECENT_PLAYLIST_NAME, items=[], downloaded_items=[], updated_at=None)
+    return jsonify(playlist)
 
 
 init_db()
