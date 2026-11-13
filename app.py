@@ -505,6 +505,7 @@ def _write_navidrome_playlist():
     """Write every recommendation M3U using the durable append order."""
     if not NAVIDROME_PLAYLIST_PATH:
         return False
+    changed = False
     playlist_dir = pathlib.Path(NAVIDROME_PLAYLIST_PATH)
     playlist_dir.mkdir(parents=True, exist_ok=True)
     with connect() as db:
@@ -512,14 +513,18 @@ def _write_navidrome_playlist():
     for playlist in playlists:
         output = playlist_dir / f"{safe_playlist_folder(playlist['name'])}.m3u"
         content = _playlist_m3u_content(playlist["id"])
+        if output.exists() and output.read_text(encoding="utf-8-sig") == content:
+            continue
         temporary = output.with_suffix(output.suffix + ".tmp")
         temporary.write_text(content, encoding="utf-8-sig", newline="\n")
         os.replace(temporary, output)
+        changed = True
         app.logger.info("Updated Navidrome playlist %s with %d tracks", playlist["id"], max(0, content.count("#EXTINF:")))
     legacy_output = playlist_dir / "Last.fm - Recent recommendations.m3u"
     if legacy_output.exists() and RECENT_PLAYLIST_NAME != legacy_output.stem:
         legacy_output.unlink(missing_ok=True)
-    return True
+        changed = True
+    return changed
 
 
 def sync_navidrome_playlist():
@@ -562,18 +567,23 @@ def append_navidrome_playlist_entry(track, local_path):
                 else:
                     db.execute("UPDATE playlist_entries SET title=?,track_id=COALESCE(track_id,?) WHERE playlist_id=? AND path=?",
                                (track["title"], track["id"], playlist_id, normalized_path))
+            playlist_changed = False
             if NAVIDROME_PLAYLIST_PATH:
                 playlist_dir = pathlib.Path(NAVIDROME_PLAYLIST_PATH)
                 playlist_dir.mkdir(parents=True, exist_ok=True)
                 output = playlist_dir / f"{folder_name}.m3u"
-                temporary = output.with_suffix(output.suffix + ".tmp")
-                temporary.write_text(_playlist_m3u_content(playlist_id), encoding="utf-8-sig", newline="\n")
-                os.replace(temporary, output)
+                content = _playlist_m3u_content(playlist_id)
+                if not output.exists() or output.read_text(encoding="utf-8-sig") != content:
+                    temporary = output.with_suffix(output.suffix + ".tmp")
+                    temporary.write_text(content, encoding="utf-8-sig", newline="\n")
+                    os.replace(temporary, output)
+                    playlist_changed = True
     except OSError as exc:
         app.logger.warning("Could not add file to Navidrome playlist: %s", exc)
         return False
-    app.logger.info("Added downloaded file to Navidrome playlist: %s", normalized_path)
-    if NAVIDROME_URL and NAVIDROME_USERNAME and NAVIDROME_PASSWORD:
+    if playlist_changed:
+        app.logger.info("Added downloaded file to Navidrome playlist: %s", normalized_path)
+    if playlist_changed and NAVIDROME_URL and NAVIDROME_USERNAME and NAVIDROME_PASSWORD:
         navidrome_scan_event.set()
     return True
 
@@ -987,7 +997,7 @@ def recommendation_playlist_monitor():
         try:
             if SLSKD_DOWNLOADS_PATH and DOWNLOAD_DESTINATION_PATH:
                 with connect() as db:
-                    pending = db.execute("SELECT * FROM tracks WHERE status='downloaded' AND move_attempts<10").fetchall()
+                    pending = db.execute("SELECT * FROM tracks WHERE status='downloaded' AND move_attempts<10 AND (local_path IS NULL OR local_path='')").fetchall()
                 moved_any = False
                 for track in pending:
                     if move_completed_file(track):
