@@ -56,6 +56,10 @@ lastfm_request_lock = threading.Lock()
 lastfm_last_request = 0.0
 active = 0
 stop_epoch = 0
+scheduler_last_error = None
+scheduler_last_error_at = None
+scheduler_last_cycle_at = None
+scheduler_thread = None
 AUDIO_EXTS = {".mp3", ".flac", ".ogg", ".opus", ".m4a", ".aac", ".wav", ".aiff", ".wma"}
 NAVIDROME_MUSIC_PATH = os.environ.get("NAVIDROME_MUSIC_PATH", "").strip()
 NAVIDROME_PLAYLIST_PATH = os.environ.get("NAVIDROME_PLAYLIST_PATH", "").strip()
@@ -1131,8 +1135,11 @@ def process_track(track_id):
 
 
 def scheduler():
+    global scheduler_last_error, scheduler_last_error_at, scheduler_last_cycle_at
     while True:
         queue_event.wait()
+        with lock:
+            scheduler_last_cycle_at = time.time()
         queue_event.clear()
         try:
             while not pause_event.is_set():
@@ -1177,7 +1184,13 @@ def scheduler():
                     break
                 for row in rows:
                     pool.submit(process_track, row["id"])
+            with lock:
+                scheduler_last_error = None
+                scheduler_last_error_at = None
         except Exception as exc:
+            with lock:
+                scheduler_last_error = str(exc)[:500]
+                scheduler_last_error_at = time.time()
             app.logger.exception("Scheduler error: %s", exc)
 
 
@@ -1292,6 +1305,78 @@ def download_found_tracks():
 @app.get("/api/control")
 def get_control():
     return jsonify(paused=pause_event.is_set())
+
+
+@app.get("/api/health/queue")
+def queue_health():
+    """Return an aggregate queue heartbeat without exposing the full track list."""
+    now = time.time()
+    active_search_statuses = ("claimed", "searching", "retrying", "sequential_searching")
+    active_download_statuses = ("download_queued", "downloading")
+    waiting_statuses = ("queued", "retry_wait", "retry_queued", "error_queued", "sequential_queued")
+    status_counts = {}
+    with connect() as db:
+        for row in db.execute("SELECT status,COUNT(*) AS count FROM tracks GROUP BY status"):
+            status_counts[row["status"]] = row["count"]
+        active_rows = db.execute(
+            "SELECT id,title,status,pass,updated,search_started_at,download_requested_at "
+            "FROM tracks WHERE status IN ('claimed','searching','retrying','sequential_searching','download_queued','downloading')"
+        ).fetchall()
+
+    searches = sum(status_counts.get(status, 0) for status in active_search_statuses)
+    downloads = sum(status_counts.get(status, 0) for status in active_download_statuses)
+    waiting = sum(status_counts.get(status, 0) for status in waiting_statuses)
+    staged = status_counts.get("staged", 0)
+    paused = pause_event.is_set()
+    suspected_stuck = []
+    cfg = settings()
+    for row in active_rows:
+        age = max(0, int(now - (row["updated"] or now)))
+        limit = None
+        if row["status"] == "claimed":
+            limit = 30
+        elif row["status"] in ("searching", "retrying", "sequential_searching"):
+            duration = cfg["retry_seconds"] if row["pass"] >= 2 else cfg["search_seconds"]
+            started = row["search_started_at"] or row["updated"] or now
+            age = max(0, int(now - started))
+            limit = duration + 75
+        else:
+            # The transfer monitor normally refreshes these rows every second.
+            limit = 15
+        if age > limit:
+            suspected_stuck.append({"title": row["title"], "status": row["status"], "age_seconds": age})
+
+    with lock:
+        worker_count = active
+        last_error = scheduler_last_error
+        last_error_at = scheduler_last_error_at
+        last_cycle_at = scheduler_last_cycle_at
+    thread = scheduler_thread
+    scheduler_alive = bool(thread and thread.is_alive())
+    event_pending = queue_event.is_set()
+    if not scheduler_alive or suspected_stuck or (last_error and (waiting or downloads)):
+        state = "attention"
+    elif searches or downloads:
+        state = "running"
+    elif paused and waiting:
+        state = "paused"
+    elif waiting:
+        state = "queued"
+    else:
+        state = "idle"
+    return jsonify(
+        state=state,
+        paused=paused,
+        scheduler={"alive": scheduler_alive, "wake_pending": event_pending,
+                   "last_cycle_at": last_cycle_at,
+                   "last_error": last_error,
+                   "last_error_at": last_error_at},
+        activity={"searches": searches, "downloads": downloads,
+                  "workers": worker_count, "waiting": waiting, "staged": staged},
+        status_counts=status_counts,
+        suspected_stuck=suspected_stuck,
+        checked_at=now,
+    )
 
 
 @app.post("/api/control")
@@ -1563,7 +1648,8 @@ def get_recent_recommendation_playlist():
 
 init_db()
 queue_event.set()
-threading.Thread(target=scheduler, daemon=True, name="track-scheduler").start()
+scheduler_thread = threading.Thread(target=scheduler, daemon=True, name="track-scheduler")
+scheduler_thread.start()
 threading.Thread(target=transfer_monitor, daemon=True, name="transfer-monitor").start()
 threading.Thread(target=recommendation_playlist_monitor, daemon=True, name="recommendation-playlist-monitor").start()
 threading.Thread(target=navidrome_scan_monitor, daemon=True, name="navidrome-scan-monitor").start()
