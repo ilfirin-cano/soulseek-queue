@@ -43,6 +43,7 @@ class Api {
     fun ping() { subsonic("ping") }
 
     fun search(query: String): List<Track> {
+        if (query.isBlank()) return emptyList()
         val root = subsonic("search3", mapOf("query" to query, "songCount" to "80", "albumCount" to "0", "artistCount" to "0"))
         val songs = root.optJSONObject("searchResult3")?.optJSONArray("song") ?: JSONArray()
         return (0 until songs.length()).map { songs.getJSONObject(it).toTrack() }
@@ -77,6 +78,42 @@ class Api {
         return array.objects().map { RecPlaylist(it.optString("id", it.optString("playlist_id")), it.optString("name"), it.optInt("recommendation_count", it.optInt("count")), it.optInt("downloaded_count")) }
     }
 
+    fun playlistDetail(playlistId: String): JSONObject {
+        require(playlistId.isNotBlank()) { "Не указан ID плейлиста" }
+        return recommendationGet("/api/playlists/${playlistId.toHttpPathSegment()}")
+    }
+
+    // soulseek-queue хранит скачанные файлы отдельно от рекомендаций. Для воспроизведения
+    // сопоставляем их метаданные с уже проиндексированными Navidrome song IDs.
+    fun playlistTracks(playlistId: String): List<Track> {
+        val detail = playlistDetail(playlistId)
+        val downloaded = detail.optJSONArray("downloaded_items")
+            ?: detail.optJSONArray("downloadedItems")
+            ?: JSONArray()
+        val result = mutableListOf<Track>()
+        for (i in 0 until downloaded.length()) {
+            val item = downloaded.optJSONObject(i) ?: continue
+            val directId = listOf("navidrome_id", "song_id", "subsonic_id").firstNotNullOfOrNull { key ->
+                item.optString(key).takeIf { it.isNotBlank() }
+            }
+            val title = item.optString("title").ifBlank {
+                item.optString("filename").ifBlank { item.optString("file_name") }
+                    .substringAfterLast('/').substringBeforeLast('.')
+            }
+            val artist = item.optString("artist")
+            val track = if (directId != null) {
+                Track(directId, title.ifBlank { "Без названия" }, artist, item.optString("album"), item.optInt("duration"))
+            } else if (title.isNotBlank()) {
+                val candidates = runCatching { search(listOf(artist, title).filter { it.isNotBlank() }.joinToString(" ")) }.getOrDefault(emptyList())
+                candidates.firstOrNull { it.title.equals(title, ignoreCase = true) &&
+                    (artist.isBlank() || it.artist.equals(artist, ignoreCase = true)) }
+                    ?: candidates.firstOrNull { it.title.equals(title, ignoreCase = true) }
+            } else null
+            if (track != null && result.none { it.id == track.id }) result.add(track)
+        }
+        return result
+    }
+
     fun createPlaylist(mode: String, name: String, queue: Boolean, query: String = "", artist: String = "", period: String = "overall", limit: Int = 25): JSONObject {
         val body = recommendationBody(mode, limit, query, artist, period)
             .put("name", name.trim().ifBlank { "Рекомендации" })
@@ -98,7 +135,11 @@ class Api {
     private fun recommendationGet(path: String): JSONObject {
         require(recommendationUrl.isNotBlank()) { "Укажите адрес soulseek-queue" }
         val request = Request.Builder().url(recommendationUrl.trimEnd('/') + path).get().build()
-        http.newCall(request).execute().use { r -> if (!r.isSuccessful) error("Soulseek Queue HTTP ${r.code}"); return JSONObject(r.body?.string().orEmpty()) }
+        http.newCall(request).execute().use { r ->
+            val payload = r.body?.string().orEmpty()
+            if (!r.isSuccessful) error("Soulseek Queue HTTP ${r.code}: ${runCatching { JSONObject(payload).optString("error") }.getOrDefault("")}")
+            return JSONObject(payload)
+        }
     }
 
     private fun postRecommendation(path: String, json: JSONObject): JSONObject {
@@ -115,4 +156,5 @@ class Api {
 
     private fun JSONObject.toTrack() = Track(getString("id"), optString("title", "Без названия"), optString("artist"), optString("album"), optInt("duration"), optString("coverArt").takeIf { it.isNotBlank() })
     private fun JSONArray.objects() = (0 until length()).mapNotNull { optJSONObject(it) }
+    private fun String.toHttpPathSegment(): String = java.net.URLEncoder.encode(this, Charsets.UTF_8.name()).replace("+", "%20")
 }
