@@ -2,6 +2,8 @@ package ru.soulseek.player.data
 
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
@@ -87,7 +89,7 @@ class Api {
     private fun postRecommendation(path: String, json: JSONObject): JSONObject {
         require(recommendationUrl.isNotBlank()) { "Укажите адрес soulseek-queue" }
         val request = Request.Builder().url(recommendationUrl.trimEnd('/') + path)
-            .post(okhttp3.RequestBody.create(okhttp3.MediaType.parse("application/json"), json.toString())).build()
+            .post(json.toString().toRequestBody("application/json".toMediaType())).build()
         http.newCall(request).execute().use { r -> if (!r.isSuccessful) error("Soulseek Queue HTTP ${r.code}: ${r.body?.string()}"); return JSONObject(r.body?.string().orEmpty()) }
     }
 
