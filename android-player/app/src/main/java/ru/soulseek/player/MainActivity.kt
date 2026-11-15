@@ -2,6 +2,9 @@ package ru.soulseek.player
 
 import android.content.ComponentName
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import java.util.concurrent.Executor
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.clickable
@@ -10,6 +13,8 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.platform.LocalContext
+import androidx.media3.common.MediaItem
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.media3.session.MediaController
@@ -35,7 +40,16 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
+@OptIn(ExperimentalMaterial3Api::class)
 private fun PlayerApp(api: Api, prefs: android.content.SharedPreferences) {
+    val context = LocalContext.current
+    var mediaController by remember { mutableStateOf<MediaController?>(null) }
+    DisposableEffect(context) {
+        val token = SessionToken(context, ComponentName(context, PlaybackService::class.java))
+        val future = MediaController.Builder(context, token).buildAsync()
+        future.addListener({ runCatching { mediaController = future.get() } }, Executor { Handler(Looper.getMainLooper()).post(it) })
+        onDispose { mediaController?.release(); mediaController = null }
+    }
     var tab by remember { mutableStateOf(0) }
     var navUrl by remember { mutableStateOf(api.navUrl) }
     var user by remember { mutableStateOf(api.username) }
@@ -78,7 +92,16 @@ private fun PlayerApp(api: Api, prefs: android.content.SharedPreferences) {
                             TextButton(onClick = { runTask { tracks = api.randomSongs(); status = "Случайные треки" } }, enabled = !busy) { Text("Случайное") }
                             TextButton(onClick = { runTask { tracks = api.starred(); status = "Избранное" } }, enabled = !busy) { Text("Избранное") }
                         }
-                        TrackList(tracks, current) { current = it; status = "Выбран: ${it.title}. Подключение плеера будет выполнено через MediaSession." }
+                        TrackList(tracks, current) {
+                            current = it
+                            runCatching {
+                                val player = mediaController ?: error("Медиасессия ещё подключается")
+                                player.setMediaItem(MediaItem.fromUri(api.streamUrl(it)))
+                                player.prepare()
+                                player.play()
+                                status = "Воспроизводится: ${it.title}"
+                            }.onFailure { status = it.message ?: "Не удалось начать воспроизведение" }
+                        }
                     }
                     1 -> {
                         Text("Персональные рекомендации soulseek-queue")
@@ -111,7 +134,18 @@ private fun PlayerApp(api: Api, prefs: android.content.SharedPreferences) {
                 Spacer(Modifier.height(8.dp))
                 if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
                 Text(status, style = MaterialTheme.typography.bodySmall)
-                current?.let { ListItem(headlineContent = { Text("Выбранный трек: ${it.title}") }, supportingContent = { Text(it.artist) }) }
+                current?.let {
+                    ListItem(
+                        headlineContent = { Text("Сейчас играет: ${it.title}") },
+                        supportingContent = { Text(it.artist) },
+                        trailingContent = {
+                            Row {
+                                TextButton(onClick = { mediaController?.pause() }) { Text("Пауза") }
+                                TextButton(onClick = { mediaController?.play() }) { Text("Играть") }
+                            }
+                        }
+                    )
+                }
             }
         }
     }
