@@ -65,6 +65,23 @@ private fun PlayerApp(api: Api, prefs: android.content.SharedPreferences) {
     var query by remember { mutableStateOf("") }
     var tracks by remember { mutableStateOf(emptyList<Track>()) }
     var recs by remember { mutableStateOf(emptyList<org.json.JSONObject>()) }
+    var recMode by remember { mutableStateOf("recent_tracks") }
+    var recQuery by remember { mutableStateOf("") }
+    var recArtist by remember { mutableStateOf("") }
+    var playlistName by remember { mutableStateOf("Рекомендации") }
+    var recPeriod by remember { mutableStateOf("overall") }
+    var enqueueRecommendations by remember { mutableStateOf(false) }
+    var modeMenu by remember { mutableStateOf(false) }
+    val recommendationModes = listOf(
+        "recent_tracks" to "Похожие на недавние прослушивания",
+        "top_tracks" to "Похожие на топ-треки",
+        "loved_tracks" to "Похожие на любимые треки",
+        "top_artists" to "Треки похожих исполнителей",
+        "genre_tracks" to "Топ треков по жанру",
+        "genre_artists" to "Исполнители по жанру",
+        "similar_artist" to "Похожие исполнители",
+        "similar_track" to "Похожие треки"
+    )
     var playlists by remember { mutableStateOf(emptyList<ru.soulseek.player.data.RecPlaylist>()) }
     var status by remember { mutableStateOf("Настройте подключения к серверам") }
     var busy by remember { mutableStateOf(false) }
@@ -111,15 +128,72 @@ private fun PlayerApp(api: Api, prefs: android.content.SharedPreferences) {
                         }
                     }
                     1 -> {
-                        Text("Персональные рекомендации soulseek-queue")
-                        Row {
-                            TextButton(onClick = { runTask { recs = api.recommendations("recent_tracks"); status = "Рекомендации обновлены: ${recs.size}" } }, enabled = !busy) { Text("Недавние") }
-                            TextButton(onClick = { runTask { recs = api.recommendations("top_tracks"); status = "Топ-треки: ${recs.size}" } }, enabled = !busy) { Text("Топ-треки") }
-                            TextButton(onClick = { runTask { recs = api.recommendations("loved_tracks"); status = "Избранное: ${recs.size}" } }, enabled = !busy) { Text("Любимые") }
+                        Text("Рекомендации Last.fm / soulseek-queue")
+                        Box {
+                            OutlinedButton(onClick = { modeMenu = true }, modifier = Modifier.fillMaxWidth()) {
+                                Text(recommendationModes.first { it.first == recMode }.second)
+                            }
+                            DropdownMenu(expanded = modeMenu, onDismissRequest = { modeMenu = false }) {
+                                recommendationModes.forEach { (key, label) ->
+                                    DropdownMenuItem(text = { Text(label) }, onClick = { recMode = key; modeMenu = false; recs = emptyList() })
+                                }
+                            }
                         }
-                        OutlinedTextField("Мои рекомендации", {}, Modifier.fillMaxWidth(), label = { Text("Название плейлиста") }, readOnly = true)
-                        TextButton(onClick = { runTask { val result = api.createPlaylist("recent_tracks", "Рекомендации", false); playlists = api.playlists(); status = "Плейлист создан: ${result.optString("playlist_id")}" } }, enabled = !busy) { Text("Создать плейлист") }
-                        LazyColumn { items(recs) { item -> ListItem(headlineContent = { Text(item.optString("name", item.optString("title", "Трек"))) }, supportingContent = { Text(item.optString("artist")) }) } }
+                        if (recMode == "genre_tracks" || recMode == "genre_artists" || recMode == "similar_artist" || recMode == "similar_track") {
+                            OutlinedTextField(recQuery, { recQuery = it }, Modifier.fillMaxWidth(), label = { Text(if (recMode.startsWith("genre")) "Жанр / тег" else if (recMode == "similar_track") "Название трека" else "Исполнитель") }, singleLine = true)
+                        }
+                        if (recMode == "similar_track") {
+                            OutlinedTextField(recArtist, { recArtist = it }, Modifier.fillMaxWidth(), label = { Text("Исполнитель исходного трека") }, singleLine = true)
+                        }
+                        if (recMode == "top_tracks") {
+                            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                                Text("Период:")
+                                listOf("overall" to "Всё время", "7day" to "7 дней", "1month" to "Месяц", "3month" to "3 месяца", "6month" to "6 месяцев", "12month" to "Год").forEach { (key, label) ->
+                                    TextButton(onClick = { recPeriod = key }) { Text(if (recPeriod == key) "[$label]" else label) }
+                                }
+                            }
+                        }
+                        OutlinedTextField(playlistName, { playlistName = it }, Modifier.fillMaxWidth(), label = { Text("Название плейлиста") }, singleLine = true)
+                        Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                            Checkbox(checked = enqueueRecommendations, onCheckedChange = { enqueueRecommendations = it })
+                            Text("Сразу искать и скачивать")
+                        }
+                        val needsQuery = recMode == "genre_tracks" || recMode == "genre_artists" || recMode == "similar_artist" || recMode == "similar_track"
+                        val validInput = (!needsQuery || recQuery.isNotBlank()) && (recMode != "similar_track" || recArtist.isNotBlank())
+                        Row {
+                            Button(onClick = {
+                                runTask {
+                                    recs = api.recommendations(recMode, 25, recQuery, recArtist, recPeriod)
+                                    status = "Рекомендаций получено: " + recs.size
+                                }
+                            }, enabled = !busy && validInput) { Text("Получить") }
+                            Spacer(Modifier.width(8.dp))
+                            Button(onClick = {
+                                runTask {
+                                    val result = api.createPlaylist(recMode, playlistName, enqueueRecommendations, recQuery, recArtist, recPeriod)
+                                    playlists = api.playlists()
+                                    status = "Плейлист создан: " + result.optString("name") + "; треков: " + (result.optJSONArray("items")?.length() ?: 0)
+                                }
+                            }, enabled = !busy && validInput) { Text("Создать плейлист") }
+                        }
+                        Text("Результаты: " + recs.size)
+                        LazyColumn(Modifier.weight(1f)) {
+                            items(recs) { item ->
+                                ListItem(
+                                    headlineContent = { Text(item.optString("title").ifBlank { item.optString("name", "Без названия") }) },
+                                    supportingContent = { Text(listOf(item.optString("artist"), item.optString("source")).filter { it.isNotBlank() }.joinToString(" • ")) }
+                                )
+                            }
+                        }
+                        Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                            Text("Плейлисты сервера")
+                            TextButton(onClick = { runTask { playlists = api.playlists(); status = "Плейлистов: " + playlists.size } }, enabled = !busy) { Text("Обновить") }
+                        }
+                        LazyColumn(Modifier.heightIn(max = 180.dp)) {
+                            items(playlists) { item ->
+                                ListItem(headlineContent = { Text(item.name) }, supportingContent = { Text("Рекомендаций: " + item.count + " • Скачано: " + item.downloadedCount) })
+                            }
+                        }
                     }
                     else -> {
                         Text("Navidrome / OpenSubsonic")
