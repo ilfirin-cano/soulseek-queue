@@ -12,7 +12,7 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 data class Track(val id: String, val title: String, val artist: String = "", val album: String = "", val duration: Int = 0, val coverId: String? = null)
-data class RecPlaylist(val id: String, val name: String, val count: Int = 0)
+data class RecPlaylist(val id: String, val name: String, val count: Int = 0, val downloadedCount: Int = 0)
 
 class Api {
     private val http = OkHttpClient.Builder().connectTimeout(15, TimeUnit.SECONDS).readTimeout(60, TimeUnit.SECONDS).build()
@@ -65,8 +65,8 @@ class Api {
         return navUrl.trimEnd('/') + "/rest/stream.view?u=$username&t=${md5(password + salt)}&s=$salt&v=1.16.1&c=SoulseekPlayer&id=${track.id}"
     }
 
-    fun recommendations(mode: String, limit: Int = 25): List<JSONObject> {
-        val body = JSONObject().put("mode", mode).put("limit", limit)
+    fun recommendations(mode: String, limit: Int = 25, query: String = "", artist: String = "", period: String = "overall"): List<JSONObject> {
+        val body = recommendationBody(mode, limit, query, artist, period)
         val root = postRecommendation("/api/lastfm/recommendations", body)
         return root.optJSONArray("items").objects()
     }
@@ -74,11 +74,26 @@ class Api {
     fun playlists(): List<RecPlaylist> {
         val root = recommendationGet("/api/playlists")
         val array = root.optJSONArray("playlists") ?: root.optJSONArray("items") ?: JSONArray()
-        return array.objects().map { RecPlaylist(it.optString("id", it.optString("playlist_id")), it.optString("name"), it.optInt("count", it.optInt("recommendation_count"))) }
+        return array.objects().map { RecPlaylist(it.optString("id", it.optString("playlist_id")), it.optString("name"), it.optInt("recommendation_count", it.optInt("count")), it.optInt("downloaded_count")) }
     }
 
-    fun createPlaylist(mode: String, name: String, queue: Boolean): JSONObject =
-        postRecommendation("/api/playlists", JSONObject().put("mode", mode).put("limit", 25).put("name", name).put("queue", queue).put("start", queue).put("download", queue))
+    fun createPlaylist(mode: String, name: String, queue: Boolean, query: String = "", artist: String = "", period: String = "overall", limit: Int = 25): JSONObject {
+        val body = recommendationBody(mode, limit, query, artist, period)
+            .put("name", name.trim().ifBlank { "Рекомендации" })
+            .put("queue", queue).put("start", queue).put("download", queue)
+        val result = postRecommendation("/api/playlists", body)
+        require(result.optString("playlist_id").isNotBlank()) {
+            result.optString("error").ifBlank { "Сервер не вернул ID созданного плейлиста" }
+        }
+        return result
+    }
+
+    private fun recommendationBody(mode: String, limit: Int, query: String, artist: String, period: String): JSONObject {
+        val body = JSONObject().put("mode", mode).put("limit", limit.coerceIn(1, 50)).put("period", period)
+        if (query.isNotBlank()) body.put("query", query.trim())
+        if (artist.isNotBlank()) body.put("artist", artist.trim())
+        return body
+    }
 
     private fun recommendationGet(path: String): JSONObject {
         require(recommendationUrl.isNotBlank()) { "Укажите адрес soulseek-queue" }
@@ -90,7 +105,12 @@ class Api {
         require(recommendationUrl.isNotBlank()) { "Укажите адрес soulseek-queue" }
         val request = Request.Builder().url(recommendationUrl.trimEnd('/') + path)
             .post(json.toString().toRequestBody("application/json".toMediaType())).build()
-        http.newCall(request).execute().use { r -> if (!r.isSuccessful) error("Soulseek Queue HTTP ${r.code}: ${r.body?.string()}"); return JSONObject(r.body?.string().orEmpty()) }
+        http.newCall(request).execute().use { r ->
+            val payload = r.body?.string().orEmpty()
+            val json = runCatching { JSONObject(payload) }.getOrElse { error("Некорректный ответ soulseek-queue, HTTP " + r.code) }
+            if (!r.isSuccessful || json.has("error")) error(json.optString("error").ifBlank { "Soulseek Queue HTTP " + r.code })
+            return json
+        }
     }
 
     private fun JSONObject.toTrack() = Track(getString("id"), optString("title", "Без названия"), optString("artist"), optString("album"), optInt("duration"), optString("coverArt").takeIf { it.isNotBlank() })
