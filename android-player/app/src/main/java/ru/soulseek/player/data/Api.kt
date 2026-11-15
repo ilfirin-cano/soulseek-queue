@@ -85,8 +85,9 @@ class Api {
 
     // soulseek-queue хранит скачанные файлы отдельно от рекомендаций. Для воспроизведения
     // сопоставляем их метаданные с уже проиндексированными Navidrome song IDs.
-    fun playlistTracks(playlistId: String): List<Track> {
-        val detail = playlistDetail(playlistId)
+    fun playlistTracks(playlistId: String): List<Track> = playlistTracks(playlistDetail(playlistId))
+
+    fun playlistTracks(detail: JSONObject): List<Track> {
         val downloaded = detail.optJSONArray("downloaded_items")
             ?: detail.optJSONArray("downloadedItems")
             ?: JSONArray()
