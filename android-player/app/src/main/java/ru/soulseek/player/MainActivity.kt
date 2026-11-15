@@ -13,19 +13,26 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.ui.platform.LocalContext
-import androidx.media3.common.MediaItem
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
+import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
-import androidx.lifecycle.lifecycleScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 import ru.soulseek.player.data.Api
+import ru.soulseek.player.data.RecPlaylist
 import ru.soulseek.player.data.Track
 
 class MainActivity : ComponentActivity() {
@@ -57,14 +64,15 @@ private fun PlayerApp(api: Api, prefs: android.content.SharedPreferences) {
         future.addListener({ runCatching { mediaController = future.get() } }, Executor { Handler(Looper.getMainLooper()).post(it) })
         onDispose { mediaController?.release(); mediaController = null }
     }
-    var tab by remember { mutableStateOf(0) }
+
+    var tab by remember { mutableIntStateOf(0) }
     var navUrl by remember { mutableStateOf(api.navUrl) }
     var user by remember { mutableStateOf(api.username) }
     var pass by remember { mutableStateOf(api.password) }
     var recUrl by remember { mutableStateOf(api.recommendationUrl) }
     var query by remember { mutableStateOf("") }
     var tracks by remember { mutableStateOf(emptyList<Track>()) }
-    var recs by remember { mutableStateOf(emptyList<org.json.JSONObject>()) }
+    var recs by remember { mutableStateOf(emptyList<JSONObject>()) }
     var recMode by remember { mutableStateOf("recent_tracks") }
     var recQuery by remember { mutableStateOf("") }
     var recArtist by remember { mutableStateOf("") }
@@ -72,6 +80,18 @@ private fun PlayerApp(api: Api, prefs: android.content.SharedPreferences) {
     var recPeriod by remember { mutableStateOf("overall") }
     var enqueueRecommendations by remember { mutableStateOf(false) }
     var modeMenu by remember { mutableStateOf(false) }
+    var playlists by remember { mutableStateOf(emptyList<RecPlaylist>()) }
+    var activePlaylistId by remember { mutableStateOf<String?>(null) }
+    var activePlaylistName by remember { mutableStateOf("") }
+    var playlistDetail by remember { mutableStateOf<JSONObject?>(null) }
+    var playlistTracks by remember { mutableStateOf(emptyList<Track>()) }
+    var playbackQueue by remember { mutableStateOf(emptyList<Track>()) }
+    var current by remember { mutableStateOf<Track?>(null) }
+    var status by remember { mutableStateOf("Настройте подключения к серверам") }
+    var busy by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    val latestQueue by rememberUpdatedState(playbackQueue)
+
     val recommendationModes = listOf(
         "recent_tracks" to "Похожие на недавние прослушивания",
         "top_tracks" to "Похожие на топ-треки",
@@ -82,11 +102,6 @@ private fun PlayerApp(api: Api, prefs: android.content.SharedPreferences) {
         "similar_artist" to "Похожие исполнители",
         "similar_track" to "Похожие треки"
     )
-    var playlists by remember { mutableStateOf(emptyList<ru.soulseek.player.data.RecPlaylist>()) }
-    var status by remember { mutableStateOf("Настройте подключения к серверам") }
-    var busy by remember { mutableStateOf(false) }
-    var current by remember { mutableStateOf<Track?>(null) }
-    val scope = rememberCoroutineScope()
 
     fun runTask(block: () -> Unit) {
         busy = true
@@ -97,34 +112,165 @@ private fun PlayerApp(api: Api, prefs: android.content.SharedPreferences) {
         }
     }
 
+    fun mediaItem(track: Track): MediaItem = MediaItem.Builder()
+        .setMediaId(track.id)
+        .setUri(api.streamUrl(track))
+        .setMediaMetadata(MediaMetadata.Builder().setTitle(track.title).setArtist(track.artist).setAlbumTitle(track.album).build())
+        .build()
+
+    fun playTracks(list: List<Track>, index: Int) {
+        if (list.isEmpty()) { status = "В плейлисте пока нет доступных в Navidrome треков"; return }
+        val player = mediaController ?: run { status = "Медиасессия ещё подключается"; return }
+        val safeIndex = index.coerceIn(0, list.lastIndex)
+        playbackQueue = list
+        current = list[safeIndex]
+        player.setMediaItems(list.map(::mediaItem), safeIndex, C.TIME_UNSET)
+        player.prepare()
+        player.play()
+        status = "Воспроизводится: ${list[safeIndex].title}"
+    }
+
+    fun openPlaylist(id: String, name: String) {
+        activePlaylistId = id
+        activePlaylistName = name
+        tab = 0
+        runTask {
+            val detail = api.playlistDetail(id)
+            val downloaded = api.playlistTracks(detail)
+            playlistDetail = detail
+            playlistTracks = downloaded
+            status = "Открыт плейлист «$name»: доступно треков — ${downloaded.size}"
+        }
+    }
+
+    // Сверка с soulseek-queue оставляет экран плейлиста актуальным во время загрузок.
+    // Новые скачанные треки добавляются в конец уже играющей очереди без перезапуска текущего трека.
+    LaunchedEffect(activePlaylistId) {
+        val id = activePlaylistId ?: return@LaunchedEffect
+        while (true) {
+            delay(7000)
+            runCatching {
+                val detail = withContext(Dispatchers.IO) { api.playlistDetail(id) }
+                val downloadedCount = detail.optJSONArray("downloaded_items")?.length()
+                    ?: detail.optJSONArray("downloadedItems")?.length() ?: 0
+                if (downloadedCount != playlistTracks.size || playlistTracks.isEmpty()) {
+                    val freshTracks = withContext(Dispatchers.IO) { api.playlistTracks(detail) }
+                    val oldIds = playlistTracks.map { it.id }
+                    val newIds = freshTracks.map { it.id }
+                    if (newIds != oldIds) {
+                        val queueIds = latestQueue.map { it.id }
+                        if (newIds.size >= oldIds.size && newIds.take(oldIds.size) == oldIds && queueIds == oldIds) {
+                            val added = freshTracks.drop(oldIds.size)
+                            if (added.isNotEmpty()) mediaController?.addMediaItems(oldIds.size, added.map(::mediaItem))
+                        } else if (queueIds == oldIds && freshTracks.isNotEmpty()) {
+                            val wasPlaying = mediaController?.isPlaying == true
+                            val currentId = mediaController?.currentMediaItem?.mediaId
+                            val newIndex = freshTracks.indexOfFirst { it.id == currentId }.coerceAtLeast(0)
+                            mediaController?.setMediaItems(freshTracks.map(::mediaItem), newIndex, C.TIME_UNSET)
+                            mediaController?.prepare()
+                            if (wasPlaying) mediaController?.play()
+                        }
+                        playlistTracks = freshTracks
+                    }
+                }
+                playlistDetail = detail
+                if (downloadedCount > 0 && playlistTracks.isEmpty()) status = "Файлы скачаны; ожидаю индексацию Navidrome"
+            }
+        }
+    }
+
+    DisposableEffect(mediaController) {
+        val listener = object : Player.Listener {
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                current = latestQueue.firstOrNull { it.id == mediaItem?.mediaId }
+            }
+        }
+        mediaController?.addListener(listener)
+        onDispose { mediaController?.removeListener(listener) }
+    }
+
     MaterialTheme {
         Scaffold(topBar = { TopAppBar(title = { Text("Soulseek Player") }) }) { pad ->
-            Column(Modifier.padding(pad).padding(16.dp).fillMaxSize()) {
+            Column(Modifier.padding(pad).padding(horizontal = 14.dp, vertical = 8.dp).fillMaxSize()) {
                 TabRow(selectedTabIndex = tab) {
                     listOf("Музыка", "Рекомендации", "Настройки").forEachIndexed { i, label ->
                         Tab(selected = tab == i, onClick = { tab = i }, text = { Text(label) })
                     }
                 }
-                Spacer(Modifier.height(12.dp))
+                Spacer(Modifier.height(8.dp))
                 when (tab) {
                     0 -> {
-                        Row(Modifier.fillMaxWidth()) {
-                            OutlinedTextField(query, { query = it }, Modifier.weight(1f), label = { Text("Поиск музыки") }, singleLine = true)
-                            TextButton(onClick = { runTask { tracks = api.search(query); status = "Найдено: ${tracks.size}" } }, enabled = !busy && query.isNotBlank()) { Text("Найти") }
-                        }
-                        Row {
-                            TextButton(onClick = { runTask { tracks = api.randomSongs(); status = "Случайные треки" } }, enabled = !busy) { Text("Случайное") }
-                            TextButton(onClick = { runTask { tracks = api.starred(); status = "Избранное" } }, enabled = !busy) { Text("Избранное") }
-                        }
-                        TrackList(tracks, current) {
-                            current = it
-                            runCatching {
-                                val player = mediaController ?: error("Медиасессия ещё подключается")
-                                player.setMediaItem(MediaItem.fromUri(api.streamUrl(it)))
-                                player.prepare()
-                                player.play()
-                                status = "Воспроизводится: ${it.title}"
-                            }.onFailure { status = it.message ?: "Не удалось начать воспроизведение" }
+                        if (activePlaylistId != null) {
+                            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                                TextButton(onClick = { activePlaylistId = null; playlistDetail = null; playlistTracks = emptyList() }) { Text("← Назад") }
+                                Text(activePlaylistName, style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                                TextButton(onClick = { runTask { val d = api.playlistDetail(activePlaylistId!!); playlistDetail = d; playlistTracks = api.playlistTracks(d); status = "Плейлист обновлён" } }, enabled = !busy) { Text("Обновить") }
+                            }
+                            val recommended = playlistDetail?.optJSONArray("items")?.asObjects().orEmpty()
+                            Text("Скачано и доступно: ${playlistTracks.size} • Рекомендаций: ${recommended.size}", style = MaterialTheme.typography.bodySmall)
+                            if (playlistTracks.isNotEmpty()) {
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Button(onClick = { playTracks(playlistTracks, 0) }) { Text("Играть всё") }
+                                    OutlinedButton(onClick = { mediaController?.seekToPreviousMediaItem() }) { Text("Предыдущий") }
+                                    OutlinedButton(onClick = { if (mediaController?.isPlaying == true) mediaController?.pause() else mediaController?.play() }) { Text(if (mediaController?.isPlaying == true) "Пауза" else "Продолжить") }
+                                    OutlinedButton(onClick = { mediaController?.seekToNextMediaItem() }) { Text("Следующий") }
+                                }
+                            }
+                            LazyColumn(Modifier.weight(1f)) {
+                                if (playlistTracks.isNotEmpty()) {
+                                    items(playlistTracks, key = { it.id }) { track ->
+                                        ListItem(
+                                            headlineContent = { Text(track.title) },
+                                            supportingContent = { Text(listOf(track.artist, track.album).filter { it.isNotBlank() }.joinToString(" • ")) },
+                                            trailingContent = { Text(if (current?.id == track.id) "▶" else "") },
+                                            modifier = Modifier.clickable { playTracks(playlistTracks, playlistTracks.indexOf(track)) }
+                                        )
+                                        HorizontalDivider()
+                                    }
+                                } else {
+                                    item { Text(if (recommended.isNotEmpty()) "Пока нет скачанных файлов. Список обновится автоматически по мере загрузки." else "В этом плейлисте пока нет треков.", modifier = Modifier.padding(16.dp)) }
+                                }
+                                if (recommended.isNotEmpty()) {
+                                    item { Text("Рекомендации и состояние загрузки", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 12.dp, bottom = 4.dp)) }
+                                    items(recommended) { item ->
+                                        val title = item.optString("title").ifBlank { item.optString("name", "Без названия") }
+                                        ListItem(
+                                            headlineContent = { Text(title) },
+                                            supportingContent = { Text(listOf(item.optString("artist"), item.optString("status")).filter { it.isNotBlank() }.joinToString(" • ")) }
+                                        )
+                                    }
+                                }
+                            }
+                        } else {
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                OutlinedTextField(query, { query = it }, Modifier.weight(1f), label = { Text("Поиск в Navidrome") }, singleLine = true)
+                                TextButton(onClick = { runTask { tracks = api.search(query); status = "Найдено: ${tracks.size}" } }, enabled = !busy && query.isNotBlank()) { Text("Найти") }
+                            }
+                            Row {
+                                TextButton(onClick = { runTask { tracks = api.randomSongs(); status = "Случайные треки" } }, enabled = !busy) { Text("Случайное") }
+                                TextButton(onClick = { runTask { tracks = api.starred(); status = "Избранное" } }, enabled = !busy) { Text("Избранное") }
+                                TextButton(onClick = { runTask { playlists = api.playlists(); status = "Плейлистов: ${playlists.size}" } }, enabled = !busy) { Text("Мои плейлисты") }
+                            }
+                            LazyColumn(Modifier.weight(1f)) {
+                                items(tracks, key = { it.id }) { track ->
+                                    ListItem(
+                                        headlineContent = { Text(track.title) },
+                                        supportingContent = { Text(listOf(track.artist, track.album).filter { it.isNotBlank() }.joinToString(" • ")) },
+                                        modifier = Modifier.clickable { playTracks(tracks, tracks.indexOf(track)) }
+                                    )
+                                    HorizontalDivider()
+                                }
+                                if (playlists.isNotEmpty()) {
+                                    item { Text("Плейлисты soulseek-queue", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(vertical = 8.dp)) }
+                                    items(playlists, key = { "pl_${it.id}" }) { playlist ->
+                                        ListItem(
+                                            headlineContent = { Text(playlist.name) },
+                                            supportingContent = { Text("Рекомендаций: ${playlist.count} • Скачано: ${playlist.downloadedCount}") },
+                                            modifier = Modifier.clickable { openPlaylist(playlist.id, playlist.name) }
+                                        )
+                                    }
+                                }
+                            }
                         }
                     }
                     1 -> {
@@ -146,7 +292,7 @@ private fun PlayerApp(api: Api, prefs: android.content.SharedPreferences) {
                             OutlinedTextField(recArtist, { recArtist = it }, Modifier.fillMaxWidth(), label = { Text("Исполнитель исходного трека") }, singleLine = true)
                         }
                         if (recMode == "top_tracks") {
-                            Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text("Период:")
                                 listOf("overall" to "Всё время", "7day" to "7 дней", "1month" to "Месяц", "3month" to "3 месяца", "6month" to "6 месяцев", "12month" to "Год").forEach { (key, label) ->
                                     TextButton(onClick = { recPeriod = key }) { Text(if (recPeriod == key) "[$label]" else label) }
@@ -154,7 +300,7 @@ private fun PlayerApp(api: Api, prefs: android.content.SharedPreferences) {
                             }
                         }
                         OutlinedTextField(playlistName, { playlistName = it }, Modifier.fillMaxWidth(), label = { Text("Название плейлиста") }, singleLine = true)
-                        Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
                             Checkbox(checked = enqueueRecommendations, onCheckedChange = { enqueueRecommendations = it })
                             Text("Сразу искать и скачивать")
                         }
@@ -164,19 +310,27 @@ private fun PlayerApp(api: Api, prefs: android.content.SharedPreferences) {
                             Button(onClick = {
                                 runTask {
                                     recs = api.recommendations(recMode, 25, recQuery, recArtist, recPeriod)
-                                    status = "Рекомендаций получено: " + recs.size
+                                    status = "Рекомендаций получено: ${recs.size}"
                                 }
                             }, enabled = !busy && validInput) { Text("Получить") }
                             Spacer(Modifier.width(8.dp))
                             Button(onClick = {
                                 runTask {
                                     val result = api.createPlaylist(recMode, playlistName, enqueueRecommendations, recQuery, recArtist, recPeriod)
+                                    val id = result.optString("playlist_id")
+                                    val name = result.optString("name").ifBlank { playlistName }
                                     playlists = api.playlists()
-                                    status = "Плейлист создан: " + result.optString("name") + "; треков: " + (result.optJSONArray("items")?.length() ?: 0)
+                                    val detail = api.playlistDetail(id)
+                                    playlistDetail = detail
+                                    playlistTracks = api.playlistTracks(detail)
+                                    activePlaylistId = id
+                                    activePlaylistName = name
+                                    tab = 0
+                                    status = "Плейлист создан и открыт: $name"
                                 }
-                            }, enabled = !busy && validInput) { Text("Создать плейлист") }
+                            }, enabled = !busy && validInput) { Text("Создать и открыть") }
                         }
-                        Text("Результаты: " + recs.size)
+                        Text("Результаты: ${recs.size}")
                         LazyColumn(Modifier.weight(1f)) {
                             items(recs) { item ->
                                 ListItem(
@@ -185,13 +339,17 @@ private fun PlayerApp(api: Api, prefs: android.content.SharedPreferences) {
                                 )
                             }
                         }
-                        Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
                             Text("Плейлисты сервера")
-                            TextButton(onClick = { runTask { playlists = api.playlists(); status = "Плейлистов: " + playlists.size } }, enabled = !busy) { Text("Обновить") }
+                            TextButton(onClick = { runTask { playlists = api.playlists(); status = "Плейлистов: ${playlists.size}" } }, enabled = !busy) { Text("Обновить") }
                         }
                         LazyColumn(Modifier.heightIn(max = 180.dp)) {
-                            items(playlists) { item ->
-                                ListItem(headlineContent = { Text(item.name) }, supportingContent = { Text("Рекомендаций: " + item.count + " • Скачано: " + item.downloadedCount) })
+                            items(playlists, key = { it.id }) { item ->
+                                ListItem(
+                                    headlineContent = { Text(item.name) },
+                                    supportingContent = { Text("Рекомендаций: ${item.count} • Скачано: ${item.downloadedCount}") },
+                                    modifier = Modifier.clickable { openPlaylist(item.id, item.name) }
+                                )
                             }
                         }
                     }
@@ -208,21 +366,24 @@ private fun PlayerApp(api: Api, prefs: android.content.SharedPreferences) {
                             prefs.edit().putString("navUrl", api.navUrl).putString("username", user).putString("password", pass).putString("recommendationUrl", api.recommendationUrl).apply()
                             runTask { api.ping(); status = "Navidrome: подключение успешно" }
                         }, enabled = !busy) { Text("Сохранить и проверить Navidrome") }
-                        Button(onClick = { api.recommendationUrl = recUrl.trim(); runTask { playlists = api.playlists(); status = "Soulseek Queue: ${playlists.size} плейлистов" } }, enabled = !busy) { Text("Проверить рекомендации") }
-                        LazyColumn { items(playlists) { ListItem(headlineContent = { Text(it.name) }, supportingContent = { Text("Треков: ${it.count}") }) } }
+                        Button(onClick = {
+                            api.recommendationUrl = recUrl.trim()
+                            runTask { playlists = api.playlists(); status = "Soulseek Queue: ${playlists.size} плейлистов" }
+                        }, enabled = !busy) { Text("Проверить рекомендации") }
                     }
                 }
-                Spacer(Modifier.height(8.dp))
+                Spacer(Modifier.height(6.dp))
                 if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
                 Text(status, style = MaterialTheme.typography.bodySmall)
-                current?.let {
+                current?.let { playing ->
                     ListItem(
-                        headlineContent = { Text("Сейчас играет: ${it.title}") },
-                        supportingContent = { Text(it.artist) },
+                        headlineContent = { Text("Сейчас играет: ${playing.title}") },
+                        supportingContent = { Text(playing.artist) },
                         trailingContent = {
                             Row {
-                                TextButton(onClick = { mediaController?.pause() }) { Text("Пауза") }
-                                TextButton(onClick = { mediaController?.play() }) { Text("Играть") }
+                                TextButton(onClick = { mediaController?.seekToPreviousMediaItem() }) { Text("Назад") }
+                                TextButton(onClick = { if (mediaController?.isPlaying == true) mediaController?.pause() else mediaController?.play() }) { Text(if (mediaController?.isPlaying == true) "Пауза" else "Играть") }
+                                TextButton(onClick = { mediaController?.seekToNextMediaItem() }) { Text("Далее") }
                             }
                         }
                     )
@@ -232,16 +393,4 @@ private fun PlayerApp(api: Api, prefs: android.content.SharedPreferences) {
     }
 }
 
-@Composable
-private fun TrackList(tracks: List<Track>, current: Track?, onSelect: (Track) -> Unit) {
-    LazyColumn(Modifier.fillMaxSize()) {
-        items(tracks) { track ->
-            ListItem(
-                headlineContent = { Text(track.title) },
-                supportingContent = { Text(listOf(track.artist, track.album).filter { it.isNotBlank() }.joinToString(" • ")) },
-                modifier = Modifier.clickable { onSelect(track) }
-            )
-            HorizontalDivider()
-        }
-    }
-}
+private fun JSONArray.asObjects(): List<JSONObject> = (0 until length()).mapNotNull { optJSONObject(it) }
