@@ -145,7 +145,7 @@ private fun PlayerApp(api: Api, prefs: android.content.SharedPreferences) {
 
     // Сверка с soulseek-queue оставляет экран плейлиста актуальным во время загрузок.
     // Новые скачанные треки добавляются в конец уже играющей очереди без перезапуска текущего трека.
-    LaunchedEffect(activePlaylistId) {
+    LaunchedEffect(activePlaylistId, mediaController) {
         val id = activePlaylistId ?: return@LaunchedEffect
         while (true) {
             delay(7000)
